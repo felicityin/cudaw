@@ -36,6 +36,7 @@ int main() {
     int *h_b = (int*)malloc(size);
     int *h_output = (int*)malloc(size);
 
+    // Allocate GPU memory
     int *d_a, *d_b, *d_output;
     CUDA_OK(cudaMalloc((void**)&d_a, size));
     CUDA_OK(cudaMalloc((void**)&d_b, size));
@@ -47,6 +48,7 @@ int main() {
         h_b[i] = i;
     }
 
+    // Copy input to GPU
     CUDA_OK(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
 
@@ -54,8 +56,10 @@ int main() {
     CUDA_OK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
     printf("num sms: %d\n", numSMs);
 
+    // Call a GPU kenrel function (launch a grid of threads)
     addV2<<<32 * numSMs, 256>>>(d_output, d_a, d_b, n);
 
+    // Copy output to CPU
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
 
     // Verify result
@@ -68,6 +72,7 @@ int main() {
     free(h_a);
     free(h_b);
     free(h_output);
+    // Deallocate GPU memory
     CUDA_OK(cudaFree(d_a));
     CUDA_OK(cudaFree(d_b));
     CUDA_OK(cudaFree(d_output));
