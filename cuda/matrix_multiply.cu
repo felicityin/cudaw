@@ -100,6 +100,53 @@ __global__ void multiplySharedMemory(int *output, const int *a, const int *b, in
     }
 }
 
+template <int BLOCK_SIZE, int COARSE_FACTOR>
+__global__ void multiplySharedMemoryCoarsening(int *output, const int *a, const int *b, int m, int n, int k) {
+    __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ int sub_b[BLOCK_SIZE][BLOCK_SIZE];
+
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int xStart = blockIdx.x * blockDim.x * COARSE_FACTOR + threadIdx.x;
+    int sum[COARSE_FACTOR];
+    for (int i = 0; i < COARSE_FACTOR; i++) {
+        sum[i] = 0;
+    }
+
+    for (int step = 0; step <= n; step += blockDim.x) {
+        int step_y = y;
+        int step_x = step + threadIdx.x;
+        if (step_y < m && step_x < n) {
+            sub_a[threadIdx.y][threadIdx.x] = a[step_y * n + step_x];
+        } else {
+            sub_a[threadIdx.y][threadIdx.x] = 0;
+        }
+
+        for (int c = 0; c < COARSE_FACTOR; c++) {
+            unsigned int col = xStart + c * BLOCK_SIZE;
+            step_y = step + threadIdx.y;
+            step_x = col;
+            if (step_y < n && step_x < k) {
+                sub_b[threadIdx.y][threadIdx.x] = b[step_y * k + step_x];
+            } else {
+                sub_b[threadIdx.y][threadIdx.x] = 0;
+            }
+            __syncthreads();
+
+            for (int i = 0; i < blockDim.x; i++) {
+                sum[c] += sub_a[threadIdx.y][i] * sub_b[i][threadIdx.x];
+            }
+            __syncthreads();
+        }
+    }
+
+    for (unsigned int i = 0; i < COARSE_FACTOR; i++) {
+        unsigned int col = xStart + i * BLOCK_SIZE;
+        if (y < m && col < k) {
+            output[y * k + col] = sum[i];
+        }
+    }
+}
+
 bool verify_result(const int *a, const int *b, int width, int height) {
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
@@ -193,6 +240,27 @@ int main() {
     CUDA_OK(cudaEventSynchronize(stopEvent));
     CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
     printf("[shared memory] Average time per multiplication: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_c, d_c, m * k * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // print_matrix(h_c, m, k);
+    assert(verify_result(h_c, c, m, k));
+
+    // -------------- Multiplication using shared memory and coarsening kernel --------------
+
+    const int COARSE_FACTOR = 4;
+    dim3 gridSize1((k + BLOCK_SIZE - 1) / BLOCK_SIZE / COARSE_FACTOR, (m + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        multiplySharedMemoryCoarsening<BLOCK_SIZE, COARSE_FACTOR><<<gridSize1, blockSize>>>(d_c, d_a, d_b, m, n, k);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[coarsening] Average time per multiplication: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_c, d_c, m * k * sizeof(int), cudaMemcpyDeviceToHost));
 
