@@ -79,11 +79,14 @@ __global__ void mm_coarse_tiled_kernel(float* C, float* A, float* B, int n) {
             __syncthreads();
 
             for (int k = 0; k < TILE_DIM; k++) {
-                sum += A_s[threadIdx.y][k] * B_s[k][threadIdx.x];
+                sum[i] += A_s[threadIdx.y][k] * B_s[k][threadIdx.x];
             }
             __syncthreads();
         }
     }
 
-    C[row * n + col] = sum;
+    for (unsigned int i = 0; i < COARSE_FACTOR; i++) {
+        unsigned int col = colStart + i * TILE_DIM;
+        C[row * n + col] = sum[i];
+    }
 }
