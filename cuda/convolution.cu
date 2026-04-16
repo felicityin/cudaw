@@ -38,7 +38,7 @@ void cpu_convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
     }
 }
 
-__global__ void convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
+__global__ void Convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
                             const int* input, int width, int height) {
     int outRow = blockIdx.y * OUT_TILE_DIM + threadIdx.y;
     int outCol = blockIdx.x * OUT_TILE_DIM + threadIdx.x;
@@ -58,30 +58,34 @@ __global__ void convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
     }
 }
 
-__global__ void mm_tiled_convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
+__global__ void MmTiledConvolution(int* output, const int mask[MASK_DIM][MASK_DIM],
                                      const int* input, int width, int height) {
     __shared__ int tiled_s[IN_TILE_DIM][IN_TILE_DIM];
 
-    int y = blockIdx.y * IN_TILE_DIM + threadIdx.y;
-    int x = blockIdx.x * IN_TILE_DIM + threadIdx.x;
-    if (y < height && x < width) {
+    int y = blockIdx.y * OUT_TILE_DIM + threadIdx.y - MASK_DIM + 1;
+    int x = blockIdx.x * OUT_TILE_DIM + threadIdx.x - MASK_DIM + 1;
+    if (y >= 0 && y < height && x >= 0 && x < width) {
         tiled_s[threadIdx.y][threadIdx.x] = input[y * width + x];
     } else {
         tiled_s[threadIdx.y][threadIdx.x] = 0;
     }
     __syncthreads();
 
-    int sum = 0;
-    for (int yy = 0; yy < MASK_DIM; yy++) {
-        for (int xx = 0; xx < MASK_DIM; xx++) {
-            int y_ = threadIdx.y + yy;
-            int x_ = threadIdx.x + xx;
-            if (y_ >= 0 && y_ < IN_TILE_DIM && x_ >= 0 && x_ < IN_TILE_DIM) {
-                sum += mask_c[yy][xx] * tiled_s[y_][x_];
+    y = blockIdx.y * OUT_TILE_DIM + threadIdx.y;
+    x = blockIdx.x * OUT_TILE_DIM + threadIdx.x;
+    if (y < height && x < width) {
+        int sum = 0;
+        for (int yy = 0; yy < MASK_DIM; yy++) {
+            for (int xx = 0; xx < MASK_DIM; xx++) {
+                int y_ = threadIdx.y + yy;
+                int x_ = threadIdx.x + xx;
+                if (y_ >= 0 && y_ < IN_TILE_DIM && x_ >= 0 && x_ < IN_TILE_DIM) {
+                    sum += mask_c[yy][xx] * tiled_s[y_][x_];
+                }
             }
         }
+        output[y * width + x] = sum;
     }
-    output[y * width + x] = sum;
 }
 
 bool verify_result(const int* result, const int* expected, int n) {
@@ -95,14 +99,14 @@ bool verify_result(const int* result, const int* expected, int n) {
 }
 
 int main() {
-    int width = 1 << 10;
+    int width = 1 << 11;
     int height = 1 << 10;
     int n = width * height;
     int mask[][MASK_DIM] = {
-        {0, 1, 0, 0},
-        {1, 1, 1, 0},
-        {0, 1, 0, 0},
-        {0, 0, 1, 1}
+        {1, 2, 3, 4},
+        {1, 2, 3, 4},
+        {1, 2, 3, 4},
+        {1, 2, 3, 4}
     };
 
     int* input = (int*)malloc(n * sizeof(int));
@@ -114,7 +118,7 @@ int main() {
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
-        input[i] = i % 10;
+        input[i] = i % 100;
     }
 
     CUDA_OK(cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice));
@@ -134,7 +138,7 @@ int main() {
 
     for (int i = 0; i < NUM_REPS; i++) {
         // Call a GPU kenrel function (launch a grid of threads)
-        convolution<<<dimGrid, dimBlock>>>(d_output, mask_c, d_input, width, height);
+        Convolution<<<dimGrid, dimBlock>>>(d_output, mask_c, d_input, width, height);
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
@@ -158,7 +162,7 @@ int main() {
 
     for (int i = 0; i < NUM_REPS; i++) {
         // Call a GPU kenrel function (launch a grid of threads)
-        mm_tiled_convolution<<<dimGrid1, dimBlock1>>>(d_output, mask_c, d_input, width, height);
+        MmTiledConvolution<<<dimGrid1, dimBlock1>>>(d_output, mask_c, d_input, width, height);
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
