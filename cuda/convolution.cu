@@ -38,7 +38,7 @@ void cpu_convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
     }
 }
 
-__global__ void Convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
+__global__ void convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
                             const int* input, int width, int height) {
     int outRow = blockIdx.y * OUT_TILE_DIM + threadIdx.y;
     int outCol = blockIdx.x * OUT_TILE_DIM + threadIdx.x;
@@ -58,7 +58,7 @@ __global__ void Convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
     }
 }
 
-__global__ void MmTiledConvolution(int* output, const int mask[MASK_DIM][MASK_DIM],
+__global__ void mmTiledConvolution(int* output, const int mask[MASK_DIM][MASK_DIM],
                                      const int* input, int width, int height) {
     __shared__ int tiled_s[IN_TILE_DIM][IN_TILE_DIM];
 
@@ -138,7 +138,7 @@ int main() {
 
     for (int i = 0; i < NUM_REPS; i++) {
         // Call a GPU kenrel function (launch a grid of threads)
-        Convolution<<<dimGrid, dimBlock>>>(d_output, mask_c, d_input, width, height);
+        convolution<<<dimGrid, dimBlock>>>(d_output, mask_c, d_input, width, height);
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
@@ -162,7 +162,7 @@ int main() {
 
     for (int i = 0; i < NUM_REPS; i++) {
         // Call a GPU kenrel function (launch a grid of threads)
-        MmTiledConvolution<<<dimGrid1, dimBlock1>>>(d_output, mask_c, d_input, width, height);
+        mmTiledConvolution<<<dimGrid1, dimBlock1>>>(d_output, mask_c, d_input, width, height);
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));

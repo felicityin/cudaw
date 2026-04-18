@@ -6,6 +6,7 @@ const int NUM_REPS = 100;
 const int GRID_SIZE = 32;
 const int BLOCK_SIZE = 256;
 const int WARP_SIZE = 32;
+const int COARSE_FACTOR = 4;
 
 #define CUDA_OK(expr) \
     do { \
@@ -16,36 +17,146 @@ const int WARP_SIZE = 32;
         } \
     } while (0)
 
-__global__ void sum(int *output, const int *input, const int count) {
+void cpu_sum(int* output, const int* input, int count) {
+    *output = 0;
+    for (int i = 0; i < count; i++) {
+        *output += input[i];
+    }
+}
+
+__global__ void sumV1(int *output, int *input, const int count) {
+    // Every thread block is responsible for twice as many elements as it has threads.
+    unsigned int segment = blockIdx.x * blockDim.x * 2;
+
+    // Threads are distributed to every other element in the segment.
+    int i = segment + threadIdx.x * 2;
+
+    // In the first iteration, each thread adds its element with the next one.
+    // In the second iteration, it adds the result with the next pair's result, and so on.
+    for (int stride = 1; stride <= blockDim.x; stride <<= 1) {
+        if (threadIdx.x % stride == 0 && i + stride < count) {
+            input[i] += input[i + stride];
+        }
+        __syncthreads();
+    }
+
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
+    if (threadIdx.x == 0) {
+        atomicAdd(output, input[segment]);
+    }
+}
+
+__global__ void sumV2(int *output, int *input, const int count) {
+    // Every thread block is responsible for twice as many elements as it has threads.
+    unsigned int segment = blockIdx.x * blockDim.x * 2;
+
+    unsigned int i = segment + threadIdx.x;
+
+    for (int stride = blockDim.x; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride && i + stride < count) {
+            input[i] += input[i + stride];
+        }
+        __syncthreads();
+    }
+
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
+    if (threadIdx.x == 0) {
+        atomicAdd(output, input[segment]);
+    }
+}
+
+__global__ void sumV3(int *output, const int *input, const int count) {
+    // Every thread block is responsible for twice as many elements as it has threads.
+    unsigned int segment = blockIdx.x * blockDim.x * 2;
+
+    unsigned int i = segment + threadIdx.x;
+
+    __shared__ int input_s[BLOCK_SIZE];
+    if (i + blockDim.x < count) {
+        input_s[threadIdx.x] = input[i] + input[i + blockDim.x];
+    } else if (i < count) {
+        input_s[threadIdx.x] = input[i];
+    } else {
+        input_s[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            input_s[threadIdx.x] += input_s[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
+    if (threadIdx.x == 0) {
+        atomicAdd(output, input_s[0]);
+    }
+}
+
+__global__ void sumV4(int *output, const int *input, const int count) {
+    unsigned int segment = blockIdx.x * blockDim.x * 2 * COARSE_FACTOR;
+
+    unsigned int i = segment + threadIdx.x;
+
+    __shared__ int input_s[BLOCK_SIZE];
+    int sum = 0;
+    for (int tile = 0; tile < COARSE_FACTOR * 2; tile++) {
+        if (i + tile * blockDim.x < count) {
+            sum += input[i + tile * blockDim.x];
+        }
+    }
+    input_s[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            input_s[threadIdx.x] += input_s[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
+    if (threadIdx.x == 0) {
+        atomicAdd(output, input_s[0]);
+    }
+}
+
+__global__ void sumV5(int *output, const int *input, const int count) {
     __shared__ int s_mem[BLOCK_SIZE];
 
-    // grid stride loop to load data
+    // Grid stride loop to load data
     s_mem[threadIdx.x] = 0;
     for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < count; i += blockDim.x * gridDim.x) {
         s_mem[threadIdx.x] += input[i];
     }
 
-    for (int total = blockDim.x / 2; total > 0; total >>= 1) {
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         __syncthreads();
-        if (threadIdx.x < total) { // parallel sweep reduction
-            s_mem[threadIdx.x] += s_mem[threadIdx.x + total];
+        if (threadIdx.x < stride) {
+            s_mem[threadIdx.x] += s_mem[threadIdx.x + stride];
         }
     }
 
-    // add the sum of all blocks together
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
     if (threadIdx.x == 0) {
         atomicAdd(output, s_mem[0]);
     }
 }
 
 __global__ void sumWarp(int *output, const int *input, const int count) {
-    // grid stride loop to load data
+    // Grid stride loop to load data
     int val = 0;
     for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < count; i += blockDim.x * gridDim.x) {
         val += input[i];
     }
 
-    // first warp-shuffle reduction
+    // First warp-shuffle reduction
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
         val += __shfl_down_sync(0xffffffff, val, offset);
     }
@@ -54,7 +165,7 @@ __global__ void sumWarp(int *output, const int *input, const int count) {
     int laneId = threadIdx.x % WARP_SIZE;
     int warpId = threadIdx.x / WARP_SIZE;
 
-    // put warp results into shared memory
+    // Put warp results into shared memory
     if (laneId == 0) {
         s_mem[warpId] = val;
     }
@@ -62,11 +173,11 @@ __global__ void sumWarp(int *output, const int *input, const int count) {
     __syncthreads();
 
     if (warpId == 0) {
-        // reload val from shared memory if warp existed
+        // Reload val from shared memory if warp existed
         int warpCount = blockDim.x / WARP_SIZE;
         val = (laneId < warpCount) ? s_mem[laneId] : 0;
 
-        // final warp-shuffle reduction
+        // Final warp-shuffle reduction
         for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
             val += __shfl_down_sync(0xffffffff, val, offset);
         }
@@ -78,7 +189,7 @@ __global__ void sumWarp(int *output, const int *input, const int count) {
 }
 
 int main() {
-    const int n = 1 << 16;
+    const int n = 1 << 10;
     const size_t size = n * sizeof(int);
 
     int *h_input = (int*)malloc(size);
@@ -90,22 +201,28 @@ int main() {
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
-        h_input[i] = i;
+        h_input[i] = 1;//i % 10;
     }
 
-    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+    int* expected = (int*)malloc(sizeof(int));
+    cpu_sum(expected, h_input, n);
 
     // events for timing
     cudaEvent_t startEvent, stopEvent;
     CUDA_OK(cudaEventCreate(&startEvent));
     CUDA_OK(cudaEventCreate(&stopEvent));
 
-    // -------------- Transpose using naive kernel --------------
+    // -------------- Sum v1 --------------
+    const unsigned int numThreadsPerBlock = BLOCK_SIZE;
+    const unsigned int numElementsPerBlock = 2 * numThreadsPerBlock;
+    const unsigned int numBlocks = (n + numElementsPerBlock - 1) / numElementsPerBlock;
+
     CUDA_OK(cudaEventRecord(startEvent));
 
     for (int i = 0; i < NUM_REPS; i++) {
+        CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
         cudaMemset(d_output, 0, sizeof(int));
-        sum<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+        sumV1<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
@@ -117,13 +234,89 @@ int main() {
     CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
 
     // Verify result
-    int s = 0;
-    for (int i = 0; i < n; ++i) {
-        s += i;
-    }
-    assert(*h_output == s);
+    assert(*h_output == *expected);
 
-    // -------------- Transpose using warp-shuffle kernel --------------
+    // -------------- Sum v2 --------------
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+        cudaMemset(d_output, 0, sizeof(int));
+        sumV2<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[v2] Average time per reduction: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(*h_output == *expected);
+
+    // -------------- Sum v3 --------------
+    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        cudaMemset(d_output, 0, sizeof(int));
+        sumV3<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[shared memory] Average time per reduction: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(*h_output == *expected);
+
+    // -------------- Sum v4 --------------
+    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    const unsigned int numThreadsPerBlock1 = BLOCK_SIZE;
+    const unsigned int numElementsPerBlock1 = 2 * numThreadsPerBlock1;
+    const unsigned int numBlocks1 = (n + numElementsPerBlock1 - 1) / numElementsPerBlock1;
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        cudaMemset(d_output, 0, sizeof(int));
+        sumV4<<<numBlocks1, numThreadsPerBlock1>>>(d_output, d_input, n);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[thread coarsening] Average time per reduction: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(*h_output == *expected);
+
+    // -------------- Sum v5 --------------
+    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        cudaMemset(d_output, 0, sizeof(int));
+        sumV5<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[common] Average time per reduction: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(*h_output == *expected);
+
+    // -------------- Sum using warp-shuffle kernel --------------
 
     CUDA_OK(cudaEventRecord(startEvent));
 
@@ -140,12 +333,13 @@ int main() {
     CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
 
     // Verify result
-    assert(*h_output == s);
+    assert(*h_output == *expected);
 
     printf("Reduction completed successfully.\n");
 
     free(h_input);
     free(h_output);
+    free(expected);
     CUDA_OK(cudaFree(d_input));
     CUDA_OK(cudaFree(d_output));
 
