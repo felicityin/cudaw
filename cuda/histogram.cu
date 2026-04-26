@@ -188,6 +188,8 @@ int main() {
     free(expected);
     CUDA_OK(cudaFree(d_image));
     CUDA_OK(cudaFree(d_bins));
+    CUDA_OK(cudaEventDestroy(startEvent));
+    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

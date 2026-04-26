@@ -178,6 +178,8 @@ int main() {
 
     printf("Convolution completed successfully.\n");
 
+    CUDA_OK(cudaEventDestroy(startEvent));
+    CUDA_OK(cudaEventDestroy(stopEvent));;
     free(input);
     free(output);
     free(expected);

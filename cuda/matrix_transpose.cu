@@ -231,6 +231,8 @@ int main() {
     free(h_output);
     CUDA_OK(cudaFree(d_input));
     CUDA_OK(cudaFree(d_output));
+    CUDA_OK(cudaEventDestroy(startEvent));
+    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

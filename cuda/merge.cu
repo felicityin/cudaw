@@ -225,6 +225,8 @@ int main() {
     CUDA_OK(cudaFree(d_a));
     CUDA_OK(cudaFree(d_b));
     CUDA_OK(cudaFree(d_c));
+    CUDA_OK(cudaEventDestroy(startEvent));
+    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }
