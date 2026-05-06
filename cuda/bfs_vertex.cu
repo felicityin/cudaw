@@ -23,57 +23,47 @@ struct CSRGraph {
 };
 
 void cpu_bfs_top_down(int* level, const CSRGraph<int> graph) {
-    int curr_level = 1;
     int new_vertex_visited = 1;
 
-    for (int vertex = 0; vertex < graph.num_vertices; vertex++) {
+    for (int curr_level = 1; new_vertex_visited; ++curr_level) {
         new_vertex_visited = 0;
 
-        // Check if the vertex is in the previous level
-        if (level[vertex] == curr_level - 1) {
-            for (int edge = graph.row_ptrs[vertex]; edge < graph.row_ptrs[vertex + 1]; edge++) {
-                int neighbor = graph.col_indices[edge];
-                if (level[neighbor] == INF) {
-                    // Add the neighbor to the current level
-                    level[neighbor] = curr_level;
-                    // Tell the host we're gonna have to do another iteration because we visited a new vertex
-                    new_vertex_visited = 1;
+        for (int vertex = 0; vertex < graph.num_vertices; vertex++) {
+            // Check if the vertex is in the previous level
+            if (level[vertex] == curr_level - 1) {
+                for (int edge = graph.row_ptrs[vertex]; edge < graph.row_ptrs[vertex + 1]; edge++) {
+                    int neighbor = graph.col_indices[edge];
+                    if (level[neighbor] == INF) {
+                        // Add the neighbor to the current level
+                        level[neighbor] = curr_level;
+                        // Tell the host we're gonna have to do another iteration because we visited a new vertex
+                        new_vertex_visited = 1;
+                    }
                 }
             }
         }
-
-        if (!new_vertex_visited) {
-            break;
-        }
-
-        curr_level++;
     }
 }
 
 void cpu_bfs_bottom_up(int* level, const CSRGraph<int> graph) {
-    int curr_level = 1;
     int new_vertex_visited = 1;
 
-    for (int vertex = 0; vertex < graph.num_vertices; vertex++) {
+    for (int curr_level = 1; new_vertex_visited; ++curr_level) {
         new_vertex_visited = 0;
 
-        for (int edge = graph.row_ptrs[vertex]; edge < graph.row_ptrs[vertex + 1]; edge++) {
-            int neighbor = graph.col_indices[edge];
-            // Check if any of neighbors are in the previous level
-            if (level[neighbor] == curr_level - 1) {
-                // Mark myself as being part of the current level
-                level[vertex] = curr_level;
-                // Tell the host we're gonna have to do another iteration because we visited a new vertex
-                new_vertex_visited = 1;
-                break;
+        for (int vertex = 0; vertex < graph.num_vertices; vertex++) {
+            for (int edge = graph.row_ptrs[vertex]; edge < graph.row_ptrs[vertex + 1]; edge++) {
+                int neighbor = graph.col_indices[edge];
+                // Check if any of neighbors are in the previous level
+                if (level[neighbor] == curr_level - 1) {
+                    // Mark myself as being part of the current level
+                    level[vertex] = curr_level;
+                    // Tell the host we're gonna have to do another iteration because we visited a new vertex
+                    new_vertex_visited = 1;
+                    break;
+                }
             }
         }
-
-        if (!new_vertex_visited) {
-            break;
-        }
-
-        curr_level++;
     }
 }
 
@@ -211,9 +201,6 @@ int main() {
         bfs_top_down<<<numBlocks, numThreadsPerBlock>>>(level_d, new_vertex_visited_d, graph_d, curr_level);
 
         CUDA_OK(cudaMemcpy(&new_vertex_visited, new_vertex_visited_d, sizeof(int), cudaMemcpyDeviceToHost));
-        if (!new_vertex_visited) {
-            break;
-        }
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
@@ -242,9 +229,6 @@ int main() {
         bfs_bottom_up<<<numBlocks, numThreadsPerBlock>>>(level_d, new_vertex_visited_d, graph_d, curr_level);
 
         CUDA_OK(cudaMemcpy(&new_vertex_visited, new_vertex_visited_d, sizeof(int), cudaMemcpyDeviceToHost));
-        if (!new_vertex_visited) {
-            break;
-        }
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
@@ -270,9 +254,6 @@ int main() {
         }
 
         CUDA_OK(cudaMemcpy(&new_vertex_visited, new_vertex_visited_d, sizeof(int), cudaMemcpyDeviceToHost));
-        if (!new_vertex_visited) {
-            break;
-        }
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));

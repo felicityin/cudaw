@@ -23,10 +23,9 @@ struct COOGraph {
 };
 
 void cpu_bfs(int* level, const COOGraph<int> graph) {
-    int curr_level = 1;
     int new_vertex_visited = 1;
 
-    for (int vertex = 0; vertex < graph.num_vertices; vertex++) {
+    for (int curr_level = 1; new_vertex_visited; ++curr_level) {
         new_vertex_visited = 0;
 
         for (int edge = 0; edge < graph.num_edges; edge++) {
@@ -39,12 +38,6 @@ void cpu_bfs(int* level, const COOGraph<int> graph) {
                 new_vertex_visited = 1;
             }
         }
-
-        if (!new_vertex_visited) {
-            break;
-        }
-
-        curr_level++;
     }
 }
 
@@ -137,9 +130,6 @@ int main() {
         bfs<<<numBlocks, numThreadsPerBlock>>>(level_d, new_vertex_visited_d, graph_d, curr_level);
 
         CUDA_OK(cudaMemcpy(&new_vertex_visited, new_vertex_visited_d, sizeof(int), cudaMemcpyDeviceToHost));
-        if (!new_vertex_visited) {
-            break;
-        }
     }
 
     CUDA_OK(cudaEventRecord(stopEvent));
