@@ -149,6 +149,43 @@ __global__ void sumV5(int *output, const int *input, const int count) {
     }
 }
 
+__global__ void sumV6(int *output, const int *input, const int count) {
+    __shared__ int s_mem[BLOCK_SIZE];
+
+    // Grid stride loop to load data
+    s_mem[threadIdx.x] = 0;
+    for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < count; i += blockDim.x * gridDim.x) {
+        s_mem[threadIdx.x] += input[i];
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > WARP_SIZE; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            s_mem[threadIdx.x] += s_mem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    // Warp reduction
+    int sum = 0;
+    if (threadIdx.x < WARP_SIZE) {
+        // stride = WARP_SIZE
+        sum = s_mem[threadIdx.x] + s_mem[threadIdx.x + WARP_SIZE];
+    }
+    for (int stride = WARP_SIZE / 2; stride > 0; stride >>= 1) {
+        // Shuffle from a thread that has a higher index
+        // The thread will take the sum value of the thread that's stride away from it,
+        // and add it to its own sum value
+        sum += __shfl_down_sync(0xffffffff, sum, stride);
+    }
+
+    // The thread zero of each block will have a partial sum of the block's segment.
+    // Add the sum of all blocks together.
+    if (threadIdx.x == 0) {
+        atomicAdd(output, sum);
+    }
+}
+
 __global__ void sumWarp(int *output, const int *input, const int count) {
     // Grid stride loop to load data
     int val = 0;
@@ -309,7 +346,26 @@ int main() {
     CUDA_OK(cudaEventRecord(stopEvent));
     CUDA_OK(cudaEventSynchronize(stopEvent));
     CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
-    printf("[common] Average time per reduction: %f ms\n", ms / NUM_REPS);
+    printf("[v5] Average time per reduction: %f ms\n", ms / NUM_REPS);
+
+    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(*h_output == *expected);
+
+    // -------------- Sum v6 --------------
+    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        cudaMemset(d_output, 0, sizeof(int));
+        sumV6<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[v6] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
 
