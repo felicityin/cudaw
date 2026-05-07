@@ -48,19 +48,64 @@ int main() {
         h_b[i] = i;
     }
 
-    // Copy input to GPU
-    CUDA_OK(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
-
     int numSMs;
     CUDA_OK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
     printf("num sms: %d\n", numSMs);
+
+    // events for timing
+    cudaEvent_t startEvent, stopEvent;
+    CUDA_OK(cudaEventCreate(&startEvent));
+    CUDA_OK(cudaEventCreate(&stopEvent));
+
+    // ------------- v1 ------------------
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    // Copy input to GPU
+    CUDA_OK(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
 
     // Call a GPU kenrel function (launch a grid of threads)
     addV2<<<32 * numSMs, 256>>>(d_output, d_a, d_b, n);
 
     // Copy output to CPU
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    float ms;
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[v1] time: %f ms\n", ms);
+
+    // Verify result
+    for (int i = 0; i < n; ++i) {
+        assert(h_output[i] == h_a[i] + h_b[i]);
+    }
+
+    free(h_a);
+    free(h_b);
+    free(h_output);
+
+    // ------------- pinned memory ------------------
+    cudaMallocHost((void**)&h_a, size);
+    cudaMallocHost((void**)&h_b, size);
+    cudaMallocHost((void**)&h_output, size);
+
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    // Copy input to GPU
+    CUDA_OK(cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice));
+
+    // Call a GPU kenrel function (launch a grid of threads)
+    addV2<<<32 * numSMs, 256>>>(d_output, d_a, d_b, n);
+
+    // Copy output to CPU
+    CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[pinned memory] time: %f ms\n", ms);
 
     // Verify result
     for (int i = 0; i < n; ++i) {
@@ -69,9 +114,9 @@ int main() {
 
     printf("Add completed successfully.\n");
 
-    free(h_a);
-    free(h_b);
-    free(h_output);
+    cudaFreeHost(h_a);
+    cudaFreeHost(h_b);
+    cudaFreeHost(h_output);
     // Deallocate GPU memory
     CUDA_OK(cudaFree(d_a));
     CUDA_OK(cudaFree(d_b));
