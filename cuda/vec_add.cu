@@ -112,6 +112,47 @@ int main() {
         assert(h_output[i] == h_a[i] + h_b[i]);
     }
 
+    // ------------- stream ------------------
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    // Setup streams
+    const int num_streams = 32;
+    cudaStream_t streams[num_streams];
+    for (int i = 0; i < num_streams; ++i) {
+        CUDA_OK(cudaStreamCreate(&streams[i]));
+    }
+
+    // Stream the segments
+    const int num_segments = num_streams;
+    const int segment_size = (n + num_segments - 1) / num_segments;
+
+    for (int i = 0; i < num_segments; ++i) {
+        // Find the segment bounds
+        int start = i * segment_size;
+        int end = start + segment_size < n ? start + segment_size : n;
+        int n_segment = end - start;
+
+        // Copy input to GPU
+        CUDA_OK(cudaMemcpyAsync(d_a + start, h_a + start, n_segment, cudaMemcpyHostToDevice, streams[i]));
+        CUDA_OK(cudaMemcpyAsync(d_b + start, h_b + start, n_segment, cudaMemcpyHostToDevice, streams[i]));
+
+        // Call a GPU kenrel function (launch a grid of threads)
+        addV2<<<32 * numSMs, 256, 0, streams[i]>>>(d_output + start, d_a + start, d_b + start, n_segment);
+
+        // Copy output to CPU
+        CUDA_OK(cudaMemcpyAsync(h_output + start, d_output + start, n_segment, cudaMemcpyDeviceToHost, streams[i]));
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[stream] time: %f ms\n", ms);
+
+    // Verify result
+    for (int i = 0; i < n; ++i) {
+        assert(h_output[i] == h_a[i] + h_b[i]);
+    }
+
     printf("Add completed successfully.\n");
 
     cudaFreeHost(h_a);
