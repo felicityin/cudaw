@@ -172,6 +172,27 @@ __global__ void bfs_dynamic_parallel(int* level, int* prev_frontier, int* curr_f
     }
 }
 
+__global__ void bfs_offload_driver(int* level, int* prev_frontier, int* curr_frontier,
+                                   int* num_curr_frontier, const CSRGraph<int> graph) { 
+    int numThreadsPerBlock = 256;
+    int num_prev_frontier = 1;
+
+    for (int curr_level = 1; num_prev_frontier > 0; ++curr_level) {
+        // Visit vertex in the previous frontier
+        *num_curr_frontier = 0;
+        unsigned int numBlocks = (num_prev_frontier + numThreadsPerBlock - 1) / numThreadsPerBlock;
+        bfs_priv_queue<<<numBlocks, numThreadsPerBlock>>>(level, prev_frontier, curr_frontier,
+                                                          num_prev_frontier, num_curr_frontier, 
+                                                         graph, curr_level);
+
+        // Swap buffers
+        int* tmp = prev_frontier;
+        prev_frontier = curr_frontier;
+        curr_frontier = tmp;
+        num_prev_frontier = *num_curr_frontier;
+    }
+}
+
 bool verify_result(const int* out_vec, const int* expected, int len) {
     for (int i = 0; i < len; i++) {
         if (out_vec[i] != expected[i]) {
@@ -182,6 +203,7 @@ bool verify_result(const int* out_vec, const int* expected, int len) {
     return true;
 }
 
+// nvcc -rdc=true --default-stream per-thread bfs_queue.cu
 int main() {
     // -------------- Construct CSRGraph start ---------------
     int n = 5;
@@ -327,6 +349,8 @@ int main() {
     assert(verify_result(level, expected, n));
 
     //--------------- BFS dynamic parellel -----------------
+    // We should increase the pending launch count to match the number of vertices
+    CUDA_OK(cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, graph_d.num_vertices));
     CUDA_OK(cudaEventRecord(startEvent));
 
     num_prev_frontier = 1;
@@ -349,7 +373,23 @@ int main() {
     CUDA_OK(cudaEventRecord(stopEvent));
     CUDA_OK(cudaEventSynchronize(stopEvent));
     CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
-    printf("[BFS private queue] Time: %f ms\n", ms);
+    printf("[BFS dynamic parellel] Time: %f ms\n", ms);
+
+     // Copy output to CPU
+    CUDA_OK(cudaMemcpy(level, level_d, graph_d.num_vertices * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(verify_result(level, expected, n));
+
+    //--------------- BFS offload driver code -----------------
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    bfs_offload_driver<<<1, 1>>>(level_d, prev_frontier_d, curr_frontier_d, num_curr_frontier_d, graph_d);
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[BFS offload driver code] Time: %f ms\n", ms);
 
     // Copy output to CPU
     CUDA_OK(cudaMemcpy(level, level_d, graph_d.num_vertices * sizeof(int), cudaMemcpyDeviceToHost));
