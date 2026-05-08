@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 
 #define CUDA_OK(expr) \
     do { \
@@ -132,6 +133,42 @@ __global__ void bfs_priv_queue(int* level, int* prev_frontier, int* curr_frontie
         for (int i = threadIdx.x; i < num_curr_frontier_s; i += blockDim.x) {
             curr_frontier[curr_frontier_start_idx + i] = curr_frontier_s[i];
         }
+    }
+}
+
+__global__ void bfs_child(int* level, int* prev_frontier, int* curr_frontier,
+                          int num_prev_frontier, int* num_curr_frontier,
+                          const CSRGraph<int> graph, int curr_level,
+                          int num_neighbors, int start) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < num_neighbors) {
+        int edge = start + i;
+        int neighbor = graph.col_indices[edge];
+        if (atomicCAS(&level[neighbor], INF, curr_level) == INF) {
+            int curr_frontier_index = atomicAdd(num_curr_frontier, 1); // return the old value
+            curr_frontier[curr_frontier_index] = neighbor;
+        }
+    }
+}
+
+__global__ void bfs_dynamic_parallel(int* level, int* prev_frontier, int* curr_frontier,
+                                     int num_prev_frontier, int* num_curr_frontier,
+                                     const CSRGraph<int> graph, int curr_level) { 
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i < num_prev_frontier) {
+        // Every thread processes one vertex in the previous frontier
+        int vertex = prev_frontier[i];
+        int start = graph.row_ptrs[vertex];
+        int num_neighbors = graph.row_ptrs[vertex + 1] - start;
+
+        int num_threads_per_block = 64;
+        int num_blocks = (num_neighbors + num_threads_per_block - 1) / num_threads_per_block;
+
+        bfs_child<<<num_blocks, num_threads_per_block>>>(level, prev_frontier, curr_frontier,
+                                                         num_prev_frontier, num_curr_frontier,
+                                                         graph, curr_level,
+                                                         num_neighbors, start);
     }
 }
 
@@ -270,6 +307,37 @@ int main() {
         bfs_priv_queue<<<numBlocks, numThreadsPerBlock>>>(level_d, prev_frontier_d, curr_frontier_d,
                                                             num_prev_frontier, num_curr_frontier_d, 
                                                             graph_d, curr_level);
+
+        // Swap buffers
+        int* tmp = prev_frontier_d;
+        prev_frontier_d = curr_frontier_d;
+        curr_frontier_d = tmp;
+        CUDA_OK(cudaMemcpy(&num_prev_frontier, num_curr_frontier_d, sizeof(int), cudaMemcpyDeviceToHost));
+    }
+
+    CUDA_OK(cudaEventRecord(stopEvent));
+    CUDA_OK(cudaEventSynchronize(stopEvent));
+    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    printf("[BFS private queue] Time: %f ms\n", ms);
+
+    // Copy output to CPU
+    CUDA_OK(cudaMemcpy(level, level_d, graph_d.num_vertices * sizeof(int), cudaMemcpyDeviceToHost));
+
+    // Verify result
+    assert(verify_result(level, expected, n));
+
+    //--------------- BFS dynamic parellel -----------------
+    CUDA_OK(cudaEventRecord(startEvent));
+
+    num_prev_frontier = 1;
+
+    for (int curr_level = 1; num_prev_frontier > 0; ++curr_level) {
+        // Visit vertex in the previous frontier
+        CUDA_OK(cudaMemset(num_curr_frontier_d, 0, sizeof(int)));
+        unsigned int numBlocks = (num_prev_frontier + numThreadsPerBlock - 1) / numThreadsPerBlock;
+        bfs_dynamic_parallel<<<numBlocks, numThreadsPerBlock>>>(level_d, prev_frontier_d, curr_frontier_d,
+                                                                num_prev_frontier, num_curr_frontier_d, 
+                                                                graph_d, curr_level);
 
         // Swap buffers
         int* tmp = prev_frontier_d;
