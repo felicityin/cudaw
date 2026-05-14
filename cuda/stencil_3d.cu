@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
 #define BLOCK_DIM 8
@@ -8,15 +11,6 @@ const int NUM_REPS = 100;
 #define OUT_TILE_DIM (IN_TILE_DIM - 2)
 #define IN_TILE_DIM1 32
 #define OUT_TILE_DIM1 (IN_TILE_DIM1 - 2)
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_stencil(int* output, const int* input, int n) {
     for (int z = 1; z < n-1; z++) {
@@ -44,7 +38,7 @@ __global__ void stencil(int* output, const int* input, int n) {
     }
 }
 
-__global__ void mmTiledStencil(int *output, const int *input, int n) {
+__global__ void stencil_tiled(int *output, const int *input, int n) {
     // It's gonna skip over OUT_TILE_DIM elements, not IN_TILE_DIM elements.
     // blockIdx.x * OUT_TILE_DIM is the beginning of the output tile.
     // But the 1st thread is not going to start at the beginning of the output.
@@ -76,7 +70,7 @@ __global__ void mmTiledStencil(int *output, const int *input, int n) {
     }
 }
 
-__global__ void mmTiledCoarseningStencil(int *output, const int *input, int n) {
+__global__ void stencil_tiled_coarsening(int *output, const int *input, int n) {
     int z_start = blockIdx.z * OUT_TILE_DIM1;
     int y = blockIdx.y * OUT_TILE_DIM1 + threadIdx.y - 1;
     int x = blockIdx.x * OUT_TILE_DIM1 + threadIdx.x - 1;
@@ -115,7 +109,7 @@ __global__ void mmTiledCoarseningStencil(int *output, const int *input, int n) {
     }
 }
 
-__global__ void mmTiledCoarseningStencilV2(int *output, const int *input, int n) {
+__global__ void stencil_tiled_coarsening_v2(int *output, const int *input, int n) {
     int z_start = blockIdx.z * OUT_TILE_DIM1;
     int y = blockIdx.y * OUT_TILE_DIM1 + threadIdx.y - 1;
     int x = blockIdx.x * OUT_TILE_DIM1 + threadIdx.x - 1;
@@ -168,27 +162,30 @@ int main() {
     int N = 1 << 9;
     int n = N * N * N;
 
-    int* input = (int*)malloc(n * sizeof(int));
-    int* output = (int*)malloc(n * sizeof(int));
+    auto input_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto output_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* input = input_buf.data();
+    int* output = output_buf.data();
+    int* expected = expected_buf.data();
 
-    int* d_input, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_output, n * sizeof(int)));
+    auto d_input_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto d_output_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* d_input = d_input_buf.data();
+    int* d_output = d_output_buf.data();
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
         input[i] = i % 10;
     }
 
-    CUDA_OK(cudaMemcpy(d_input, input, n * sizeof(int), cudaMemcpyHostToDevice));
+    d_input_buf.copy_from_host(input, static_cast<std::size_t>(n));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Convolution using naive kernel --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     dim3 dimBlock(BLOCK_DIM, BLOCK_DIM, BLOCK_DIM);
     dim3 dimGrid((N + BLOCK_DIM - 1) / BLOCK_DIM,
                  (N + BLOCK_DIM - 1) / BLOCK_DIM,
@@ -198,23 +195,19 @@ int main() {
         // Call a GPU kenrel function (launch a grid of threads)
         stencil<<<dimGrid, dimBlock>>>(d_output, d_input, N);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[baseline] Average time per stencil: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
+    d_output_buf.copy_to_host(output, static_cast<std::size_t>(n));
+    d_output_buf.synchronize();
 
     // Verify result
-    int* expected = (int*)malloc(n * sizeof(int));
     cpu_stencil(expected, input, N);
     assert(verify_result(output, expected, n));
 
     // -------------- Convolution using shared memory --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     // Eatch block needs to have enough threads to process the entire input tile dimension
     dim3 dimBlock1(IN_TILE_DIM, IN_TILE_DIM, IN_TILE_DIM);
     // We need enough blocks to cover all the output tiles
@@ -224,69 +217,55 @@ int main() {
 
     for (int i = 0; i < NUM_REPS; i++) {
         // Call a GPU kenrel function (launch a grid of threads)
-        mmTiledStencil<<<dimGrid1, dimBlock1>>>(d_output, d_input, N);
+        stencil_tiled<<<dimGrid1, dimBlock1>>>(d_output, d_input, N);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per stencil: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
+    d_output_buf.copy_to_host(output, static_cast<std::size_t>(n));
+    d_output_buf.synchronize();
 
     // Verify result
     assert(verify_result(output, expected, n));
 
     // -------------- Convolution using shared memory and thread coarsening --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     dim3 dimBlock2(IN_TILE_DIM1, IN_TILE_DIM1, 1);
     dim3 dimGrid2((N + OUT_TILE_DIM1 - 1) / OUT_TILE_DIM1,
                   (N + OUT_TILE_DIM1 - 1) / OUT_TILE_DIM1,
                   (N + OUT_TILE_DIM1 - 1) / OUT_TILE_DIM1);
 
     for (int i = 0; i < NUM_REPS; i++) {
-        mmTiledCoarseningStencil<<<dimGrid2, dimBlock2>>>(d_output, d_input, N);
+        stencil_tiled_coarsening<<<dimGrid2, dimBlock2>>>(d_output, d_input, N);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[thread coarsening] Average time per stencil: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
+    d_output_buf.copy_to_host(output, static_cast<std::size_t>(n));
+    d_output_buf.synchronize();
 
     // Verify result
     assert(verify_result(output, expected, n));
 
     // -------------- Convolution using shared memory and thread coarsening v2 --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        mmTiledCoarseningStencilV2<<<dimGrid2, dimBlock2>>>(d_output, d_input, N);
+        stencil_tiled_coarsening_v2<<<dimGrid2, dimBlock2>>>(d_output, d_input, N);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[register coarsening] Average time per stencil: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
+    d_output_buf.copy_to_host(output, static_cast<std::size_t>(n));
+    d_output_buf.synchronize();
 
     // Verify result
     assert(verify_result(output, expected, n));
 
     printf("Stencil completed successfully.\n");
-
-    free(input);
-    free(output);
-    free(expected);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

@@ -1,17 +1,11 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
 #include <vector>
 
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int WARP_SIZE = 32;
 
@@ -76,73 +70,64 @@ __global__ void enqueue_v2(int* queue, int* queue_size, const int* input, int n)
 int main() {
     int n = 1 << 10;
 
-    int* input = (int*)malloc(n * sizeof(int));
+    auto input_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* input = input_buf.data();
     for (int i = 0; i < n; i++) {
         input[i] = i;
     }
 
-    int* input_d;
-    int* queue_d;
-    int* queue_size_d;
-    CUDA_OK(cudaMalloc((void**)&input_d, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&queue_d, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&queue_size_d, sizeof(int)));
+    auto input_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto queue_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto queue_size_d_buf = CudaBuffer<int>::with_capacity(1);
+    int* input_d = input_d_buf.data();
+    int* queue_d = queue_d_buf.data();
+    int* queue_size_d = queue_size_d_buf.data();
 
-    CUDA_OK(cudaMemcpy(input_d, input, n * sizeof(int), cudaMemcpyHostToDevice));
+    input_d_buf.copy_from_host(input, static_cast<std::size_t>(n));
 
-    int* expected = (int*)malloc(n * sizeof(int));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* expected = expected_buf.data();
     int q_size = cpu_enqueue(expected, input, n);
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     unsigned int numThreadsPerBlock = 256;
     unsigned int numBlocks = (n + numThreadsPerBlock - 1) / numThreadsPerBlock;
 
     //--------------- Wrap Vote V1 ----------------
-    CUDA_OK(cudaMemset(queue_size_d, 0, sizeof(int)));
-    CUDA_OK(cudaEventRecord(startEvent));
+    queue_size_d_buf.fill_zero();
+    timer.start();
 
     enqueue_v1<<<numBlocks, numThreadsPerBlock>>>(queue_d, queue_size_d, input_d, n);
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[v1] Time: %f ms\n", ms);
 
     // Copy output to CPU
     int queue_size = 0;
-    CUDA_OK(cudaMemcpy(&queue_size, queue_size_d, sizeof(int), cudaMemcpyDeviceToHost));
+    queue_size_d_buf.copy_to_host(&queue_size, 1);
+    queue_size_d_buf.synchronize();
 
     // Verify result
     assert(queue_size == q_size);
 
     //--------------- Wrap Vote V2 ----------------
-    CUDA_OK(cudaMemset(queue_size_d, 0, sizeof(int)));
-    CUDA_OK(cudaEventRecord(startEvent));
+    queue_size_d_buf.fill_zero();
+    timer.start();
 
     enqueue_v2<<<numBlocks, numThreadsPerBlock>>>(queue_d, queue_size_d, input_d, n);
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[v2] Time: %f ms\n", ms);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(&queue_size, queue_size_d, sizeof(int), cudaMemcpyDeviceToHost));
+    queue_size_d_buf.copy_to_host(&queue_size, 1);
+    queue_size_d_buf.synchronize();
 
     // Verify result
     assert(queue_size == q_size);
 
     printf("Wrap Vote completed successfully.\n");
-
-    free(expected);
-    CUDA_OK(cudaFree(queue_d));
-    CUDA_OK(cudaFree(queue_size_d));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
     return 0;
 }

@@ -1,17 +1,11 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_matrix_multiply(int *output, const int *a, const int *b, int m, int n, int k) {
     for (int y = 0; y < m; y++) {
@@ -25,7 +19,7 @@ void cpu_matrix_multiply(int *output, const int *a, const int *b, int m, int n, 
     }
 }
 
-__global__ void multiplyNaive(int *output, const int *a, const int *b, int m, int n, int k) {
+__global__ void multiply_naive(int *output, const int *a, const int *b, int m, int n, int k) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -62,7 +56,7 @@ __global__ void multiplyNaive(int *output, const int *a, const int *b, int m, in
 //
 // sub_c = sub_a_step_0 * sub_b_step_0 + sub_a_step_1 * sub_b_step_1;
 template <int BLOCK_SIZE>
-__global__ void multiplySharedMemory(int *output, const int *a, const int *b, int m, int n, int k) {
+__global__ void multiply_tiling(int *output, const int *a, const int *b, int m, int n, int k) {
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ int sub_b[BLOCK_SIZE][BLOCK_SIZE];
 
@@ -101,7 +95,7 @@ __global__ void multiplySharedMemory(int *output, const int *a, const int *b, in
 }
 
 template <int BLOCK_SIZE, int COARSE_FACTOR>
-__global__ void multiplySharedMemoryCoarsening(int *output, const int *a, const int *b, int m, int n, int k) {
+__global__ void multiply_tiling_coarse(int *output, const int *a, const int *b, int m, int n, int k) {
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
     __shared__ int sub_b[BLOCK_SIZE][BLOCK_SIZE];
 
@@ -172,14 +166,21 @@ int main() {
     int n = 1 << 11;
     int k = 1 << 10;
 
-    int *h_a = (int*)malloc(m * n * sizeof(int));
-    int *h_b = (int*)malloc(n * k * sizeof(int));
-    int *h_c = (int*)malloc(m * k * sizeof(int));
+    auto h_a_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(m) * n);
+    auto h_b_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n) * k);
+    auto h_c_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
+    auto c_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
+    int* h_a = h_a_buf.data();
+    int* h_b = h_b_buf.data();
+    int* h_c = h_c_buf.data();
+    int* c = c_buf.data();
 
-    int *d_a, *d_b, *d_c;
-    CUDA_OK(cudaMalloc((void**)&d_a, m * n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_b, n * k * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_c, m * k * sizeof(int)));
+    auto d_a_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(m) * n);
+    auto d_b_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n) * k);
+    auto d_c_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
+    int* d_a = d_a_buf.data();
+    int* d_b = d_b_buf.data();
+    int* d_c = d_c_buf.data();
 
     // Initialize input matrix
     for (int i = 0; i < m * n; ++i) {
@@ -189,15 +190,11 @@ int main() {
         h_b[i] = i;
     }
 
-    CUDA_OK(cudaMemcpy(d_a, h_a, m * n * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(d_b, h_b, n * k * sizeof(int), cudaMemcpyHostToDevice));
+    d_a_buf.copy_from_host(h_a, static_cast<std::size_t>(m) * n);
+    d_b_buf.copy_from_host(h_b, static_cast<std::size_t>(n) * k);
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
-
-    float ms;
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Multiplication using naive kernel --------------
 
@@ -205,23 +202,18 @@ int main() {
     dim3 dimBlock(block_size, block_size);
     dim3 dimGrid((k + block_size - 1) / block_size, (m + block_size - 1) / block_size);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        multiplyNaive<<<dimGrid, dimBlock>>>(d_c, d_a, d_b, m, n, k);
+        multiply_naive<<<dimGrid, dimBlock>>>(d_c, d_a, d_b, m, n, k);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[native] Average time per multiplication: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_c, d_c, m * k * sizeof(int), cudaMemcpyDeviceToHost));
+    d_c_buf.copy_to_host(h_c, static_cast<std::size_t>(m) * k);
+    d_c_buf.synchronize();
 
-    int *c = (int*)malloc(m * k * sizeof(int));
     cpu_matrix_multiply(c, h_a, h_b, m, n, k);
-    // print_matrix(c, m, k);
-    // print_matrix(h_c, m, k);
     assert(verify_result(h_c, c, m, k));
 
     // -------------- Multiplication using shared memory kernel --------------
@@ -230,20 +222,17 @@ int main() {
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize((k + BLOCK_SIZE - 1) / BLOCK_SIZE, (m + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        multiplySharedMemory<BLOCK_SIZE><<<gridSize, blockSize>>>(d_c, d_a, d_b, m, n, k);
+        multiply_tiling<BLOCK_SIZE><<<gridSize, blockSize>>>(d_c, d_a, d_b, m, n, k);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per multiplication: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_c, d_c, m * k * sizeof(int), cudaMemcpyDeviceToHost));
+    d_c_buf.copy_to_host(h_c, static_cast<std::size_t>(m) * k);
+    d_c_buf.synchronize();
 
-    // print_matrix(h_c, m, k);
     assert(verify_result(h_c, c, m, k));
 
     // -------------- Multiplication using shared memory and coarsening kernel --------------
@@ -251,32 +240,20 @@ int main() {
     const int COARSE_FACTOR = 4;
     dim3 gridSize1((k + BLOCK_SIZE - 1) / BLOCK_SIZE / COARSE_FACTOR, (m + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        multiplySharedMemoryCoarsening<BLOCK_SIZE, COARSE_FACTOR><<<gridSize1, blockSize>>>(d_c, d_a, d_b, m, n, k);
+        multiply_tiling_coarse<BLOCK_SIZE, COARSE_FACTOR><<<gridSize1, blockSize>>>(d_c, d_a, d_b, m, n, k);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[coarsening] Average time per multiplication: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_c, d_c, m * k * sizeof(int), cudaMemcpyDeviceToHost));
+    d_c_buf.copy_to_host(h_c, static_cast<std::size_t>(m) * k);
+    d_c_buf.synchronize();
 
-    // print_matrix(h_c, m, k);
     assert(verify_result(h_c, c, m, k));
 
     printf("Multiplication completed successfully.\n");
-
-    free(h_a);
-    free(h_b);
-    free(h_c);
-    CUDA_OK(cudaFree(d_a));
-    CUDA_OK(cudaFree(d_b));
-    CUDA_OK(cudaFree(d_c));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

@@ -1,18 +1,12 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
 
-int NUM_REPS = 100;
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
+int NUM_REPS = 100;
 
 template<typename T>
 struct ELLMatrix {
@@ -77,9 +71,12 @@ int main() {
     csr_matrix.num_rows = rows;
     csr_matrix.num_cols = cols;
     csr_matrix.num_none_zeros = nnz;
-    csr_matrix.row_ptr = (int*)malloc((csr_matrix.num_rows + 1) * sizeof(int));
-    csr_matrix.col_indices = (int*)malloc(csr_matrix.num_none_zeros * sizeof(int));
-    csr_matrix.values = (int*)malloc(csr_matrix.num_none_zeros * sizeof(int));
+    auto csr_row_ptr_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_rows + 1));
+    auto csr_col_indices_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_none_zeros));
+    auto csr_values_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_none_zeros));
+    csr_matrix.row_ptr = csr_row_ptr_buf.data();
+    csr_matrix.col_indices = csr_col_indices_buf.data();
+    csr_matrix.values = csr_values_buf.data();
     csr_matrix.row_ptr[0] = 0;
 
     // Build a valid CSR row_ptr for any nnz/row ratio.
@@ -99,7 +96,8 @@ int main() {
     ELLMatrix<int> ell_matrix;
     ell_matrix.num_rows = rows;
     ell_matrix.num_cols = cols;
-    ell_matrix.nnz_per_row = (int*)malloc(rows * sizeof(int));
+    auto nnz_per_row_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(rows));
+    ell_matrix.nnz_per_row = nnz_per_row_buf.data();
 
     int max_nnz_per_row = 0;
     for (int i = 0; i < rows; ++i) {
@@ -108,8 +106,10 @@ int main() {
         max_nnz_per_row = max_nnz_per_row < nnz ? nnz : max_nnz_per_row;
     }
     ell_matrix.max_nnz_per_row = max_nnz_per_row;
-    ell_matrix.col_indices = (int*)malloc(max_nnz_per_row * rows * sizeof(int));
-    ell_matrix.values = (int*)malloc(max_nnz_per_row * rows * sizeof(int));
+    auto ell_col_indices_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(max_nnz_per_row) * rows);
+    auto ell_values_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(max_nnz_per_row) * rows);
+    ell_matrix.col_indices = ell_col_indices_buf.data();
+    ell_matrix.values = ell_values_buf.data();
 
     for (int i = 0; i < rows; ++i) {
         int row_start = csr_matrix.row_ptr[i];
@@ -124,79 +124,63 @@ int main() {
         }
     }
 
-    int* in_vec = (int*)malloc(cols * sizeof(int));
+    auto in_vec_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(cols));
+    int* in_vec = in_vec_buf.data();
     for (int i = 0; i < cols; i++) {
         in_vec[i] = i % 1000;
     }
 
-    int* out_vec = (int*)malloc(rows * sizeof(int));
+    auto out_vec_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(rows));
+    int* out_vec = out_vec_buf.data();
 
     ELLMatrix<int> ell_matrix_d;
     ell_matrix_d.num_rows = ell_matrix.num_rows;
     ell_matrix_d.num_cols = ell_matrix.num_cols;
     ell_matrix_d.max_nnz_per_row = ell_matrix.max_nnz_per_row;
-    CUDA_OK(cudaMalloc((void**)&ell_matrix_d.nnz_per_row, rows * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&ell_matrix_d.col_indices, max_nnz_per_row * rows * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&ell_matrix_d.values, max_nnz_per_row * rows * sizeof(int)));
-    CUDA_OK(cudaMemcpy(ell_matrix_d.nnz_per_row, ell_matrix.nnz_per_row, rows * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(ell_matrix_d.values, ell_matrix.values, max_nnz_per_row * rows * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_OK(cudaMemcpy(ell_matrix_d.col_indices, ell_matrix.col_indices, max_nnz_per_row * rows * sizeof(int), cudaMemcpyHostToDevice));
+    auto nnz_per_row_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(rows));
+    auto ell_col_indices_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(max_nnz_per_row) * rows);
+    auto ell_values_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(max_nnz_per_row) * rows);
+    ell_matrix_d.nnz_per_row = nnz_per_row_d_buf.data();
+    ell_matrix_d.col_indices = ell_col_indices_d_buf.data();
+    ell_matrix_d.values = ell_values_d_buf.data();
+    nnz_per_row_d_buf.copy_from_host(ell_matrix.nnz_per_row, static_cast<std::size_t>(rows));
+    ell_values_d_buf.copy_from_host(ell_matrix.values, static_cast<std::size_t>(max_nnz_per_row) * rows);
+    ell_col_indices_d_buf.copy_from_host(ell_matrix.col_indices, static_cast<std::size_t>(max_nnz_per_row) * rows);
 
-    int* in_vec_d;
-    CUDA_OK(cudaMalloc((void**)&in_vec_d, cols * sizeof(int)));
-    CUDA_OK(cudaMemcpy(in_vec_d, in_vec, cols * sizeof(int), cudaMemcpyHostToDevice));
+    auto in_vec_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(cols));
+    int* in_vec_d = in_vec_d_buf.data();
+    in_vec_d_buf.copy_from_host(in_vec, static_cast<std::size_t>(cols));
 
-    int* out_vec_d;
-    CUDA_OK(cudaMalloc((void**)&out_vec_d, rows * sizeof(int)));
+    auto out_vec_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(rows));
+    int* out_vec_d = out_vec_d_buf.data();
 
-    int* expected = (int*)malloc(rows * sizeof(int));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(rows));
+    int* expected = expected_buf.data();
     memset(expected, 0, rows * sizeof(int));
     cpu_spmv_ell(expected, ell_matrix, in_vec);
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- SpMV using ELL --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     unsigned int numThreadsPerBlock = 1024;
     unsigned int numBlocks = (ell_matrix.num_rows + numThreadsPerBlock - 1) / numThreadsPerBlock;
 
     for (int i = 0; i < NUM_REPS; i++) {
-        CUDA_OK(cudaMemset(out_vec_d, 0, rows * sizeof(int)));
+        out_vec_d_buf.fill_zero();
         spmv_ell<<<numBlocks, numThreadsPerBlock>>>(out_vec_d, ell_matrix_d, in_vec_d);
         CUDA_OK(cudaGetLastError());
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[ELL] Average time per SpMV: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
-    CUDA_OK(cudaMemcpy(out_vec, out_vec_d, rows * sizeof(int), cudaMemcpyDeviceToHost));
+    out_vec_d_buf.copy_to_host(out_vec, static_cast<std::size_t>(rows));
+    out_vec_d_buf.synchronize();
 
     // Verify result
     assert(verify_result(out_vec, expected, rows));
     printf("SpMV ELL completed successfully.\n");
-
-    free(csr_matrix.values);
-    free(csr_matrix.row_ptr);
-    free(csr_matrix.col_indices);
-    free(ell_matrix.values);
-    free(ell_matrix.nnz_per_row);
-    free(ell_matrix.col_indices);
-    free(in_vec);
-    free(out_vec);
-    free(expected);
-    CUDA_OK(cudaFree(ell_matrix_d.values));
-    CUDA_OK(cudaFree(ell_matrix_d.nnz_per_row));
-    CUDA_OK(cudaFree(ell_matrix_d.col_indices));
-    CUDA_OK(cudaFree(in_vec_d));
-    CUDA_OK(cudaFree(out_vec_d));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));
     return 0;
 }

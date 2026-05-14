@@ -3,6 +3,8 @@
 #include <string>
 #include <iomanip>
 
+#include "include/exception.cuh"
+
 void printDeviceProperties(const cudaDeviceProp& prop) {
     std::cout << std::left << std::setw(40) << std::setfill(' ') << "Device Name: " << prop.name << std::endl;
     std::cout << std::setw(40) << "Compute Capability: " << prop.major << "." << prop.minor << std::endl;
@@ -74,25 +76,14 @@ void printDeviceProperties(const cudaDeviceProp& prop) {
 
 int main() {
     int deviceCount = 0;
-    cudaError_t error = cudaGetDeviceCount(&deviceCount);
-    
-    if (error != cudaSuccess) {
-        std::cout << "Failed to get device count: " << cudaGetErrorString(error) << std::endl;
-        return 1;
-    }
+    CUDA_OK(cudaGetDeviceCount(&deviceCount));
     
     std::cout << "System has " << deviceCount << " CUDA device(s)" << std::endl;
     std::cout << "==========================================" << std::endl;
     
     for (int device = 0; device < deviceCount; ++device) {
         cudaDeviceProp prop;
-        error = cudaGetDeviceProperties(&prop, device);
-        
-        if (error != cudaSuccess) {
-            std::cout << "Failed to get device " << device << " properties: " 
-                      << cudaGetErrorString(error) << std::endl;
-            continue;
-        }
+        CUDA_OK(cudaGetDeviceProperties(&prop, device));
         
         std::cout << "\nDevice " << device << ":" << std::endl;
         std::cout << "------------------------------------------" << std::endl;
