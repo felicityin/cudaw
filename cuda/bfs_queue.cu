@@ -1,18 +1,12 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
 #include <vector>
 #include <algorithm>
 
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int INF = -1;
 
@@ -24,10 +18,10 @@ struct CSRGraph {
 };
 
 void cpu_bfs_top_down(int* level, const CSRGraph<int> graph) {
-    int* buffer1 = (int*)malloc(graph.num_vertices * sizeof(int));
-    int* buffer2 = (int*)malloc(graph.num_vertices * sizeof(int));
-    int* prev_frontier = buffer1;
-    int* curr_frontier = buffer2;
+    auto buffer1_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(graph.num_vertices));
+    auto buffer2_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(graph.num_vertices));
+    int* prev_frontier = buffer1_buf.data();
+    int* curr_frontier = buffer2_buf.data();
     prev_frontier[0] = 0;
     int num_prev_frontier = 1;
     int num_curr_frontier = 0;
@@ -54,9 +48,6 @@ void cpu_bfs_top_down(int* level, const CSRGraph<int> graph) {
         curr_frontier = tmp;
         num_prev_frontier = num_curr_frontier;
     }
-
-    free(buffer1);
-    free(buffer2);
 }
 
 __global__ void bfs_global_queue(int* level, int* prev_frontier, int* curr_frontier,
@@ -217,8 +208,10 @@ int main() {
     CSRGraph<int> graph;
     graph.num_vertices = n;
     graph.num_edges = edges.size();
-    graph.row_ptrs = (int*)malloc((n + 1) * sizeof(int));
-    graph.col_indices = (int*)malloc(edges.size() * sizeof(int));
+    auto row_ptrs_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n + 1));
+    auto col_indices_buf = HostBuffer<int>::with_capacity(edges.size());
+    graph.row_ptrs = row_ptrs_buf.data();
+    graph.col_indices = col_indices_buf.data();
     
     std::vector<int> degree(n, 0);
     for (const auto& [u, v] : edges) {
@@ -245,40 +238,43 @@ int main() {
     CSRGraph<int> graph_d;
     graph_d.num_vertices = graph.num_vertices;
     graph_d.num_edges = graph.num_edges;
-    CUDA_OK(cudaMalloc((void**)&graph_d.row_ptrs, (graph_d.num_vertices + 1) * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&graph_d.col_indices, graph_d.num_edges * sizeof(int)));
+    auto row_ptrs_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(graph_d.num_vertices + 1));
+    auto col_indices_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(graph_d.num_edges));
+    graph_d.row_ptrs = row_ptrs_d_buf.data();
+    graph_d.col_indices = col_indices_d_buf.data();
     CUDA_OK(cudaMemcpy(graph_d.row_ptrs, graph.row_ptrs, (graph_d.num_vertices + 1) * sizeof(int),
                        cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(graph_d.col_indices, graph.col_indices, graph_d.num_edges * sizeof(int),
                        cudaMemcpyHostToDevice));
 
-    int* expected = (int*)malloc(n * sizeof(int));
-
-    int* level = (int*)malloc(n * sizeof(int));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto level_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* expected = expected_buf.data();
+    int* level = level_buf.data();
     memset(level, INF, n * sizeof(int));
     int src_vertex = 0;
     level[src_vertex] = 0;
 
-    int* new_vertex_visited_d;
-    CUDA_OK(cudaMalloc((void**)&new_vertex_visited_d, sizeof(int)));
-    int* level_d;
-    CUDA_OK(cudaMalloc((void**)&level_d, graph_d.num_vertices * sizeof(int)));
-    CUDA_OK(cudaMemcpy(level_d, level, graph_d.num_vertices * sizeof(int), cudaMemcpyHostToDevice));
+    auto level_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(graph_d.num_vertices));
+    int* level_d = level_d_buf.data();
 
-    int* buffer1_d;
-    int* buffer2_d;
-    CUDA_OK(cudaMalloc((void**)&buffer1_d, graph_d.num_vertices * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&buffer2_d, graph_d.num_vertices * sizeof(int)));
-    int* prev_frontier_d = buffer1_d;
-    int* curr_frontier_d = buffer2_d;
-    CUDA_OK(cudaMemcpy(prev_frontier_d, &src_vertex, sizeof(int), cudaMemcpyHostToDevice));
-    int* num_curr_frontier_d = buffer1_d + graph_d.num_vertices;
-    CUDA_OK(cudaMalloc((void**)&num_curr_frontier_d, sizeof(int)));
+    auto buffer1_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(graph_d.num_vertices));
+    auto buffer2_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(graph_d.num_vertices));
+    int* prev_frontier_d = buffer1_d_buf.data();
+    int* curr_frontier_d = buffer2_d_buf.data();
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    auto num_curr_frontier_d_buf = CudaBuffer<int>::with_capacity(1);
+    int* num_curr_frontier_d = num_curr_frontier_d_buf.data();
+
+    auto reset_state = [&]() {
+        memset(level, INF, n * sizeof(int));
+        level[src_vertex] = 0;
+        CUDA_OK(cudaMemcpy(level_d, level, graph_d.num_vertices * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(prev_frontier_d, &src_vertex, sizeof(int), cudaMemcpyHostToDevice));
+    };
+
+    CudaTimer timer;
+    float ms = 0.0f;
 
     memset(expected, INF, n * sizeof(int));
     expected[0] = 0;
@@ -288,7 +284,9 @@ int main() {
     int num_prev_frontier = 1;
 
     //--------------- BFS global queue -----------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    reset_state();
+    num_prev_frontier = 1;
+    timer.start();
 
     for (int curr_level = 1; num_prev_frontier > 0; ++curr_level) {
         // Visit vertex in the previous frontier
@@ -304,11 +302,7 @@ int main() {
         curr_frontier_d = tmp;
         CUDA_OK(cudaMemcpy(&num_prev_frontier, num_curr_frontier_d, sizeof(int), cudaMemcpyDeviceToHost));
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[BFS global queue] Time: %f ms\n", ms);
 
     // Copy output to CPU
@@ -318,9 +312,9 @@ int main() {
     assert(verify_result(level, expected, n));
 
     //--------------- BFS private queue -----------------
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    reset_state();
     num_prev_frontier = 1;
+    timer.start();
 
     for (int curr_level = 1; num_prev_frontier > 0; ++curr_level) {
         // Visit vertex in the previous frontier
@@ -336,10 +330,7 @@ int main() {
         curr_frontier_d = tmp;
         CUDA_OK(cudaMemcpy(&num_prev_frontier, num_curr_frontier_d, sizeof(int), cudaMemcpyDeviceToHost));
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[BFS private queue] Time: %f ms\n", ms);
 
     // Copy output to CPU
@@ -351,9 +342,9 @@ int main() {
     //--------------- BFS dynamic parellel -----------------
     // We should increase the pending launch count to match the number of vertices
     CUDA_OK(cudaDeviceSetLimit(cudaLimitDevRuntimePendingLaunchCount, graph_d.num_vertices));
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    reset_state();
     num_prev_frontier = 1;
+    timer.start();
 
     for (int curr_level = 1; num_prev_frontier > 0; ++curr_level) {
         // Visit vertex in the previous frontier
@@ -369,10 +360,7 @@ int main() {
         curr_frontier_d = tmp;
         CUDA_OK(cudaMemcpy(&num_prev_frontier, num_curr_frontier_d, sizeof(int), cudaMemcpyDeviceToHost));
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[BFS dynamic parellel] Time: %f ms\n", ms);
 
      // Copy output to CPU
@@ -382,13 +370,11 @@ int main() {
     assert(verify_result(level, expected, n));
 
     //--------------- BFS offload driver code -----------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    reset_state();
+    timer.start();
 
     bfs_offload_driver<<<1, 1>>>(level_d, prev_frontier_d, curr_frontier_d, num_curr_frontier_d, graph_d);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[BFS offload driver code] Time: %f ms\n", ms);
 
     // Copy output to CPU
@@ -398,16 +384,5 @@ int main() {
     assert(verify_result(level, expected, n));
 
     printf("BFS/CSR completed successfully.\n");
-
-    free(graph.row_ptrs);
-    free(graph.col_indices);
-    free(level);
-    free(expected);
-    CUDA_OK(cudaFree(graph_d.row_ptrs));
-    CUDA_OK(cudaFree(graph_d.col_indices));
-    CUDA_OK(cudaFree(new_vertex_visited_d));
-    CUDA_OK(cudaFree(level_d));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
     return 0;
 }

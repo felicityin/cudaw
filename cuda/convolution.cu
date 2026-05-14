@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
 #define OUT_TILE_DIM 32
@@ -9,15 +12,6 @@ const int NUM_REPS = 100;
 #define IN_TILE_DIM (OUT_TILE_DIM + MASK_DIM - 1)
 
 __constant__ int mask_c[MASK_DIM][MASK_DIM];
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_convolution(int* output, const int mask[MASK_DIM][MASK_DIM],
                      const int* input, int width, int height) {
@@ -109,12 +103,17 @@ int main() {
         {1, 2, 3, 4}
     };
 
-    int* input = (int*)malloc(n * sizeof(int));
-    int* output = (int*)malloc(n * sizeof(int));
+    auto input_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto output_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* input = input_buf.data();
+    int* output = output_buf.data();
+    int* expected = expected_buf.data();
 
-    int* d_input, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_output, n * sizeof(int)));
+    auto d_input_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto d_output_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* d_input = d_input_buf.data();
+    int* d_output = d_output_buf.data();
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
@@ -126,13 +125,11 @@ int main() {
     // Copy mask to constant memory
     CUDA_OK(cudaMemcpyToSymbol(mask_c, mask, MASK_DIM * MASK_DIM * sizeof(int)));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Convolution using naive kernel --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     dim3 dimBlock(OUT_TILE_DIM, OUT_TILE_DIM);
     dim3 dimGrid((width + OUT_TILE_DIM - 1) / OUT_TILE_DIM, (height + OUT_TILE_DIM - 1) / OUT_TILE_DIM);
 
@@ -140,23 +137,18 @@ int main() {
         // Call a GPU kenrel function (launch a grid of threads)
         convolution<<<dimGrid, dimBlock>>>(d_output, mask_c, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[baseline] Average time per convolution: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
     CUDA_OK(cudaMemcpy(output, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
 
     // Verify result
-    int* expected = (int*)malloc(n * sizeof(int));
     cpu_convolution(expected, mask, input, width, height);
     assert(verify_result(output, expected, n));
 
     // -------------- Convolution using shared memory --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     dim3 dimBlock1(IN_TILE_DIM, IN_TILE_DIM);
     dim3 dimGrid1((width + OUT_TILE_DIM - 1) / OUT_TILE_DIM, (height + OUT_TILE_DIM - 1) / OUT_TILE_DIM);
 
@@ -164,10 +156,7 @@ int main() {
         // Call a GPU kenrel function (launch a grid of threads)
         mmTiledConvolution<<<dimGrid1, dimBlock1>>>(d_output, mask_c, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per convolution: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -177,14 +166,6 @@ int main() {
     assert(verify_result(output, expected, n));
 
     printf("Convolution completed successfully.\n");
-
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
-    free(input);
-    free(output);
-    free(expected);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output));
 
     return 0;
 }

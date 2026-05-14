@@ -1,21 +1,14 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
 const int GRID_SIZE = 32;
 const int BLOCK_SIZE = 256;
 const int WARP_SIZE = 32;
 const int COARSE_FACTOR = 4;
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_sum(int* output, const int* input, int count) {
     *output = 0;
@@ -227,179 +220,157 @@ __global__ void sumWarp(int *output, const int *input, const int count) {
 
 int main() {
     const int n = 1 << 10;
-    const size_t size = n * sizeof(int);
 
-    int *h_input = (int*)malloc(size);
-    int *h_output = (int*)malloc(sizeof(int));
+    auto h_input = HostBuffer<int>::with_capacity(n);
+    h_input.set_len(n);
+    auto h_output = HostBuffer<int>::with_capacity(1);
+    h_output.set_len(1);
 
-    int *d_input, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, size));
-    CUDA_OK(cudaMalloc((void**)&d_output, size));
+    auto d_input = CudaBuffer<int>::with_capacity(n);
+    d_input.set_len(n);
+    auto d_output = CudaBuffer<int>::with_capacity(1);
+    d_output.set_len(1);
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
-        h_input[i] = 1;//i % 10;
+        h_input[i] = 1;  // i % 10;
     }
 
-    int* expected = (int*)malloc(sizeof(int));
-    cpu_sum(expected, h_input, n);
+    auto expected = HostBuffer<int>::with_capacity(1);
+    expected.set_len(1);
+    cpu_sum(expected.data(), h_input.data(), n);
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    // timer for timing
+    CudaTimer timer;
 
     // -------------- Sum v1 --------------
     const unsigned int numThreadsPerBlock = BLOCK_SIZE;
     const unsigned int numElementsPerBlock = 2 * numThreadsPerBlock;
     const unsigned int numBlocks = (n + numElementsPerBlock - 1) / numElementsPerBlock;
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV1<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
+        d_input.copy_from_host(h_input.data(), n);
+        d_output.reset();
+        sumV1<<<numBlocks, numThreadsPerBlock>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    float ms = timer.elapsed_ms();
     printf("[baseline] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum v2 --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV2<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
+        d_input.copy_from_host(h_input.data(), n);
+        d_output.reset();
+        sumV2<<<numBlocks, numThreadsPerBlock>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[v2] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum v3 --------------
-    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaEventRecord(startEvent));
+    d_input.copy_from_host(h_input.data(), n);
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV3<<<numBlocks, numThreadsPerBlock>>>(d_output, d_input, n);
+        d_output.reset();
+        sumV3<<<numBlocks, numThreadsPerBlock>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum v4 --------------
-    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaEventRecord(startEvent));
+    d_input.copy_from_host(h_input.data(), n);
+    timer.start();
 
     const unsigned int numThreadsPerBlock1 = BLOCK_SIZE;
     const unsigned int numElementsPerBlock1 = 2 * numThreadsPerBlock1;
     const unsigned int numBlocks1 = (n + numElementsPerBlock1 - 1) / numElementsPerBlock1;
 
     for (int i = 0; i < NUM_REPS; i++) {
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV4<<<numBlocks1, numThreadsPerBlock1>>>(d_output, d_input, n);
+        d_output.reset();
+        sumV4<<<numBlocks1, numThreadsPerBlock1>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[thread coarsening] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum v5 --------------
-    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaEventRecord(startEvent));
+    d_input.copy_from_host(h_input.data(), n);
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV5<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+        d_output.reset();
+        sumV5<<<GRID_SIZE, BLOCK_SIZE>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[v5] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum v6 --------------
-    CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
-    CUDA_OK(cudaEventRecord(startEvent));
+    d_input.copy_from_host(h_input.data(), n);
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        cudaMemset(d_output, 0, sizeof(int));
-        sumV6<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+        d_output.reset();
+        sumV6<<<GRID_SIZE, BLOCK_SIZE>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[v6] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     // -------------- Sum using warp-shuffle kernel --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        cudaMemset(d_output, 0, sizeof(int));
-        sumWarp<<<GRID_SIZE, BLOCK_SIZE>>>(d_output, d_input, n);
+        d_output.reset();
+        sumWarp<<<GRID_SIZE, BLOCK_SIZE>>>(d_output.data(), d_input.data(), n);
     }
 
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[warp-shuffle] Average time per reduction: %f ms\n", ms / NUM_REPS);
 
-    CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int), cudaMemcpyDeviceToHost));
+    d_output.copy_to_host(h_output.data(), 1);
 
     // Verify result
-    assert(*h_output == *expected);
+    assert(h_output[0] == expected[0]);
 
     printf("Reduction completed successfully.\n");
-
-    free(h_input);
-    free(h_output);
-    free(expected);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

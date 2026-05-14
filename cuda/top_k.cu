@@ -1,20 +1,15 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+#include <climits>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
 const int GRID_SIZE = 32;
 const int BLOCK_SIZE = 256;
 const int TOP_K = 10;
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 // topk: 10, 9, 8, ..., 1
 __device__ __host__ void insertTopK(int *topk, int val) {
@@ -72,13 +67,17 @@ int main() {
     const int n = 1 << 16;
     const size_t size = n * sizeof(int);
 
-    int *h_input = (int*)malloc(size);
-    int *h_output = (int*)malloc(sizeof(int) * TOP_K);
+    auto h_input_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto h_output_buf = HostBuffer<int>::with_capacity(TOP_K);
+    int* h_input = h_input_buf.data();
+    int* h_output = h_output_buf.data();
 
-    int *d_input, *d_output_1, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, size));
-    CUDA_OK(cudaMalloc((void**)&d_output_1, sizeof(int) * TOP_K * GRID_SIZE));
-    CUDA_OK(cudaMalloc((void**)&d_output, sizeof(int) * TOP_K));
+    auto d_input_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto d_output_1_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(TOP_K * GRID_SIZE));
+    auto d_output_buf = CudaBuffer<int>::with_capacity(TOP_K);
+    int* d_input = d_input_buf.data();
+    int* d_output_1 = d_output_1_buf.data();
+    int* d_output = d_output_buf.data();
     // Initialize input
     for (int i = 0; i < n; ++i) {
         h_input[i] = i;
@@ -86,12 +85,8 @@ int main() {
 
     CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
-
-    CUDA_OK(cudaEventRecord(startEvent));
+    CudaTimer timer;
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         // cudaMemset(d_output, 0, sizeof(int));
@@ -101,11 +96,7 @@ int main() {
 
         CUDA_OK(cudaDeviceSynchronize());
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    float ms = timer.elapsed_ms();
     printf("Average time per reduction: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, sizeof(int) * TOP_K, cudaMemcpyDeviceToHost));
@@ -121,14 +112,6 @@ int main() {
     }
 
     printf("Top K completed successfully.\n");
-
-    free(h_input);
-    free(h_output);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output_1));
-    CUDA_OK(cudaFree(d_output));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

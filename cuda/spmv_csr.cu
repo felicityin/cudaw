@@ -1,18 +1,12 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
 
-int NUM_REPS = 100;
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
+int NUM_REPS = 100;
 
 template<typename T>
 struct CSRMatrix {
@@ -105,9 +99,12 @@ int main() {
     csr_matrix.num_rows = row;
     csr_matrix.num_cols = col;
     csr_matrix.num_none_zeros = nnz;
-    csr_matrix.row_ptr = (int*)malloc((csr_matrix.num_rows + 1) * sizeof(int));
-    csr_matrix.col_indices = (int*)malloc(csr_matrix.num_none_zeros * sizeof(int));
-    csr_matrix.values = (int*)malloc(csr_matrix.num_none_zeros * sizeof(int));
+    auto row_ptr_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_rows + 1));
+    auto col_indices_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_none_zeros));
+    auto values_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix.num_none_zeros));
+    csr_matrix.row_ptr = row_ptr_buf.data();
+    csr_matrix.col_indices = col_indices_buf.data();
+    csr_matrix.values = values_buf.data();
     csr_matrix.row_ptr[0] = 0;
 
     // Build a valid CSR row_ptr for any nnz/row ratio.
@@ -125,42 +122,46 @@ int main() {
     }
     assert(validate_csr(csr_matrix));
 
-    int* in_vec = (int*)malloc(col * sizeof(int));
+    auto in_vec_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(col));
+    int* in_vec = in_vec_buf.data();
     for (int i = 0; i < col; i++) {
         in_vec[i] = i % 1000;
     }
 
-    int* out_vec = (int*)malloc(row * sizeof(int));
+    auto out_vec_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(row));
+    int* out_vec = out_vec_buf.data();
 
     CSRMatrix<int> csr_matrix_d;
     csr_matrix_d.num_rows = csr_matrix.num_rows;
     csr_matrix_d.num_cols = csr_matrix.num_cols;
     csr_matrix_d.num_none_zeros = csr_matrix.num_none_zeros;
-    CUDA_OK(cudaMalloc((void**)&csr_matrix_d.row_ptr, (csr_matrix_d.num_rows + 1) * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&csr_matrix_d.col_indices, csr_matrix_d.num_none_zeros * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&csr_matrix_d.values, csr_matrix_d.num_none_zeros * sizeof(int)));
+    auto row_ptr_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix_d.num_rows + 1));
+    auto col_indices_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix_d.num_none_zeros));
+    auto values_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(csr_matrix_d.num_none_zeros));
+    csr_matrix_d.row_ptr = row_ptr_d_buf.data();
+    csr_matrix_d.col_indices = col_indices_d_buf.data();
+    csr_matrix_d.values = values_d_buf.data();
     CUDA_OK(cudaMemcpy(csr_matrix_d.values, csr_matrix.values, csr_matrix.num_none_zeros * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(csr_matrix_d.row_ptr, csr_matrix.row_ptr, (csr_matrix.num_rows + 1) * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(csr_matrix_d.col_indices, csr_matrix.col_indices, csr_matrix.num_none_zeros * sizeof(int), cudaMemcpyHostToDevice));
 
-    int* in_vec_d;
-    CUDA_OK(cudaMalloc((void**)&in_vec_d, col * sizeof(int)));
+    auto in_vec_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(col));
+    int* in_vec_d = in_vec_d_buf.data();
     CUDA_OK(cudaMemcpy(in_vec_d, in_vec, col * sizeof(int), cudaMemcpyHostToDevice));
 
-    int* out_vec_d;
-    CUDA_OK(cudaMalloc((void**)&out_vec_d, row * sizeof(int)));
+    auto out_vec_d_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(row));
+    int* out_vec_d = out_vec_d_buf.data();
 
-    int* expected = (int*)malloc(row * sizeof(int));
+    auto expected_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(row));
+    int* expected = expected_buf.data();
     memset(expected, 0, row * sizeof(int));
     cpu_spmv_csr(expected, csr_matrix, in_vec);
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- SpMV using CSR --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     unsigned int numThreadsPerBlock = 1024;
     unsigned int numBlocks = (csr_matrix.num_rows + numThreadsPerBlock - 1) / numThreadsPerBlock;
 
@@ -169,11 +170,7 @@ int main() {
         spmv_csr<<<numBlocks, numThreadsPerBlock>>>(out_vec_d, csr_matrix_d, in_vec_d);
         CUDA_OK(cudaGetLastError());
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[CSR] Average time per SpMV: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -182,19 +179,5 @@ int main() {
     // Verify result
     assert(verify_result(out_vec, expected, row));
     printf("SpMV CSR completed successfully.\n");
-
-    free(csr_matrix.values);
-    free(csr_matrix.row_ptr);
-    free(csr_matrix.col_indices);
-    free(in_vec);
-    free(out_vec);
-    free(expected);
-    CUDA_OK(cudaFree(csr_matrix_d.values));
-    CUDA_OK(cudaFree(csr_matrix_d.row_ptr));
-    CUDA_OK(cudaFree(csr_matrix_d.col_indices));
-    CUDA_OK(cudaFree(in_vec_d));
-    CUDA_OK(cudaFree(out_vec_d));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));
     return 0;
 }

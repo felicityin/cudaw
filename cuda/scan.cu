@@ -1,18 +1,12 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 #define BLOCK_SIZE 1024
 #define COARSE_FACTOR 8
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_scan(int* output, const int* input, int n) {
     output[0] = input[0];
@@ -342,12 +336,17 @@ bool verify_result(const int* result, const int* expected, int n) {
 int main() {
     int n = 1 << 16;
 
-    int* h = (int*)malloc(n * sizeof(int));
-    int* h_r = (int*)malloc(n * sizeof(int));
+    auto h_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto h_r_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto h_t_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* h = h_buf.data();
+    int* h_r = h_r_buf.data();
+    int* h_t = h_t_buf.data();
 
-    int* d_input, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_output, n * sizeof(int)));\
+    auto d_input_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    auto d_output_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n));
+    int* d_input = d_input_buf.data();
+    int* d_output = d_output_buf.data();
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
@@ -356,38 +355,26 @@ int main() {
 
     CUDA_OK(cudaMemcpy(d_input, h, n * sizeof(int), cudaMemcpyHostToDevice));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Scan using Kogge-Stone algorithm --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    timer.start();
     scan_d_kogge_stone(d_output, d_input, n, 0);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("Scan using Kogge-Stone algorithm: %f ms\n", ms);
 
     CUDA_OK(cudaMemcpy(h_r, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
 
-    int* h_t = (int*)malloc(n * sizeof(int));
     cpu_scan(h_t, h, n);
     assert(verify_result(h_r, h_t, n));
 
     // -------------- Scan using Kogge-Stone algorithm with shared memory --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    timer.start();
     scan_d_kogge_stone(d_output, d_input, n, 1);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("Scan using Kogge-Stone algorithm with shared memory: %f ms\n", ms);
 
     CUDA_OK(cudaMemcpy(h_r, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -396,13 +383,9 @@ int main() {
 
     // -------------- Scan using Kogge-Stone algorithm with double buffering --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    timer.start();
     scan_d_kogge_stone(d_output, d_input, n, 2);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("Scan using Kogge-Stone algorithm with double buffering: %f ms\n", ms);
 
     CUDA_OK(cudaMemcpy(h_r, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -411,13 +394,9 @@ int main() {
 
     // -------------- Scan using Kogge-Stone algorithm with thread coarsening --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    timer.start();
     scan_d_kogge_stone_v2(d_output, d_input, n);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("Scan using Kogge-Stone algorithm with thread coarsening: %f ms\n", ms);
 
     CUDA_OK(cudaMemcpy(h_r, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -426,13 +405,9 @@ int main() {
 
     // -------------- Scan using brent kung algorithm with shared memory and double buffering --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
-
+    timer.start();
     scan_d_brent_kung(d_output, d_input, n);
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("Scan using Brent-Kung algorithm with shared memory: %f ms\n", ms);
 
     CUDA_OK(cudaMemcpy(h_r, d_output, n * sizeof(int), cudaMemcpyDeviceToHost));
@@ -440,13 +415,6 @@ int main() {
     assert(verify_result(h_r, h_t, n));
 
     printf("Scan completed successfully.\n");
-
-    free(h);
-    free(h_t);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

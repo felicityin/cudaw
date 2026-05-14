@@ -1,19 +1,13 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int TILE_DIM = 32;
 const int BLOCK_ROWS = 8;
 const int NUM_REPS = 100;
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 __global__ void transposeNaive(int *output, const int *input, int width, int height) {
     int col = blockIdx.x * TILE_DIM + threadIdx.x;
@@ -124,12 +118,15 @@ int main() {
     int height = 1 << 20;
     const size_t size = width * height * sizeof(int);
 
-    int *h_input = (int*)malloc(size);
-    int *h_output = (int*)malloc(size);
+    auto h_input_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(width) * height);
+    auto h_output_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(width) * height);
+    int* h_input = h_input_buf.data();
+    int* h_output = h_output_buf.data();
 
-    int *d_input, *d_output;
-    CUDA_OK(cudaMalloc((void**)&d_input, size));
-    CUDA_OK(cudaMalloc((void**)&d_output, size));
+    auto d_input_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(width) * height);
+    auto d_output_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(width) * height);
+    int* d_input = d_input_buf.data();
+    int* d_output = d_output_buf.data();
 
     // Initialize input matrix
     for (int i = 0; i < width * height; ++i) {
@@ -138,27 +135,20 @@ int main() {
 
     CUDA_OK(cudaMemcpy(d_input, h_input, size, cudaMemcpyHostToDevice));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
-
-    float ms;
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Transpose using naive kernel --------------
 
     dim3 dimBlock(TILE_DIM, TILE_DIM);
     dim3 dimGrid((width + TILE_DIM - 1) / TILE_DIM, (height + TILE_DIM - 1) / TILE_DIM);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         transposeNaive<<<dimGrid, dimBlock>>>(d_output, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[native] Average time per transpose: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
@@ -170,15 +160,12 @@ int main() {
     dim3 blockSize(TILE_DIM, BLOCK_ROWS);
     dim3 gridSize((width + TILE_DIM - 1) / TILE_DIM, (height + TILE_DIM - 1) / TILE_DIM);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         transposeNaiveV2<<<gridSize, blockSize>>>(d_output, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[native v2] Average time per transpose: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
@@ -187,15 +174,12 @@ int main() {
 
     // -------------- Transpose using shared memory kernel --------------
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         transposeSharedMemory<<<gridSize, blockSize>>>(d_output, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per transpose: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
@@ -210,15 +194,12 @@ int main() {
     dim3 grid(grid_x * grid_y);
     dim3 block(TILE_DIM);
 
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         transposeSharedMemoryV2<<<grid, block>>>(d_output, d_input, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory v2] Average time per transpose: %f ms\n", ms / NUM_REPS);
 
     CUDA_OK(cudaMemcpy(h_output, d_output, size, cudaMemcpyDeviceToHost));
@@ -226,13 +207,6 @@ int main() {
     assert(verify_result(h_output, h_input, width, height));
 
     printf("Transpose completed successfully.\n");
-
-    free(h_input);
-    free(h_output);
-    CUDA_OK(cudaFree(d_input));
-    CUDA_OK(cudaFree(d_output));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

@@ -1,20 +1,14 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
+
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
 const int NUM_REPS = 100;
 const int NUM_BINS = 256;
 const int CORSE_FACTOR = 16;
-
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
 
 void cpu_histogram(unsigned int* bins, const unsigned char* image, int width, int height) {
     for (int i = 0; i < width * height; i++) {
@@ -95,32 +89,34 @@ int main() {
     int height = 1 << 10;
     int n = width * height;
 
-    unsigned char* image = (unsigned char*)malloc(n * sizeof(unsigned char));
-    unsigned int* bins = (unsigned int*)malloc(NUM_BINS * sizeof(unsigned int));
+    auto image_buf = HostBuffer<unsigned char>::with_capacity(static_cast<std::size_t>(n));
+    auto bins_buf = HostBuffer<unsigned int>::with_capacity(NUM_BINS);
+    auto expected_buf = HostBuffer<unsigned int>::with_capacity(NUM_BINS);
 
-    unsigned char* d_image;
-    unsigned int* d_bins;
-    CUDA_OK(cudaMalloc((void**)&d_image, n * sizeof(unsigned char)));
-    CUDA_OK(cudaMalloc((void**)&d_bins, NUM_BINS * sizeof(unsigned int)));
+    unsigned char* image = image_buf.data();
+    unsigned int* bins = bins_buf.data();
+    unsigned int* expected = expected_buf.data();
+
+    auto d_image_buf = CudaBuffer<unsigned char>::with_capacity(static_cast<std::size_t>(n));
+    auto d_bins_buf = CudaBuffer<unsigned int>::with_capacity(NUM_BINS);
+    unsigned char* d_image = d_image_buf.data();
+    unsigned int* d_bins = d_bins_buf.data();
 
     // Initialize input
     for (int i = 0; i < n; ++i) {
         image[i] = i % NUM_BINS;
     }
 
-    unsigned int* expected = (unsigned int*)malloc(NUM_BINS * sizeof(unsigned int));
     memset(expected, 0, NUM_BINS * sizeof(unsigned int));
     cpu_histogram(expected, image, width, height);
 
     CUDA_OK(cudaMemcpy(d_image, image, n * sizeof(unsigned char), cudaMemcpyHostToDevice));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Histogram using naive kernel --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     unsigned int numThreadsPerBlock = 1024;
     unsigned int numBlocks = (n + numThreadsPerBlock - 1) / numThreadsPerBlock;
 
@@ -128,11 +124,7 @@ int main() {
         CUDA_OK(cudaMemset(d_bins, 0, 256 * sizeof(int)));
         histogram<<<numBlocks, numThreadsPerBlock>>>(d_bins, d_image, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[baseline] Average time per histogram: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -142,16 +134,13 @@ int main() {
     assert(verify_result(bins, expected, 256));
 
     // -------------- Histogram using shared memory --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
         CUDA_OK(cudaMemset(d_bins, 0, 256 * sizeof(int)));
         histogram_mm<<<numBlocks, numThreadsPerBlock>>>(d_bins, d_image, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per histogram: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -161,7 +150,7 @@ int main() {
     assert(verify_result(bins, expected, 256));
 
     // -------------- Histogram using thread coarsening --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     unsigned int numThreadsPerBlock1 = 1024;
     unsigned int numBlocks1 = (n + numThreadsPerBlock1 - 1) / numThreadsPerBlock1 / CORSE_FACTOR;
 
@@ -169,10 +158,7 @@ int main() {
         CUDA_OK(cudaMemset(d_bins, 0, 256 * sizeof(int)));
         histogram_mm_corse<<<numBlocks1, numThreadsPerBlock1>>>(d_bins, d_image, width, height);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[thread coarsening] Average time per histogram: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -182,14 +168,6 @@ int main() {
     assert(verify_result(bins, expected, 256));
 
     printf("Histogram completed successfully.\n");
-
-    free(image);
-    free(bins);
-    free(expected);
-    CUDA_OK(cudaFree(d_image));
-    CUDA_OK(cudaFree(d_bins));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }

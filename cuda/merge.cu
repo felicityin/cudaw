@@ -1,18 +1,12 @@
 #include <stdio.h>
 #include <assert.h>
-#include <cuda_runtime.h>
 #include <cstring>
 
-int NUM_REPS = 100;
+#include "include/buffer.cuh"
+#include "include/exception.cuh"
+#include "include/timer.cuh"
 
-#define CUDA_OK(expr) \
-    do { \
-        cudaError_t code = expr; \
-        if (code != cudaSuccess) { \
-            fprintf(stderr, "CUDA Error %s at %s:%d\n", cudaGetErrorString(code), __FILE__, __LINE__); \
-            exit(1); \
-        } \
-    } while (0)
+int NUM_REPS = 100;
 
 __host__ __device__ void mergeSequential(int* output, int* a, int* b, int m, int n) {
     unsigned int i = 0;
@@ -148,16 +142,21 @@ int main() {
     unsigned int m = 1 << 6;
     unsigned int n = 1 << 6;
 
-    int* a = (int*)malloc(m * sizeof(int));
-    int* b = (int*)malloc(n * sizeof(int));
-    int* c = (int*)malloc((m + n) * sizeof(int));
+    auto a_buf = HostBuffer<int>::with_capacity(m);
+    auto b_buf = HostBuffer<int>::with_capacity(n);
+    auto c_buf = HostBuffer<int>::with_capacity(m + n);
+    auto expected_buf = HostBuffer<int>::with_capacity(m + n);
+    int* a = a_buf.data();
+    int* b = b_buf.data();
+    int* c = c_buf.data();
+    int* expected = expected_buf.data();
 
-    int* d_a;
-    int* d_b;
-    int* d_c;
-    CUDA_OK(cudaMalloc((void**)&d_a, m * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_b, n * sizeof(int)));
-    CUDA_OK(cudaMalloc((void**)&d_c, (m + n) * sizeof(int)));
+    auto d_a_buf = CudaBuffer<int>::with_capacity(m);
+    auto d_b_buf = CudaBuffer<int>::with_capacity(n);
+    auto d_c_buf = CudaBuffer<int>::with_capacity(m + n);
+    int* d_a = d_a_buf.data();
+    int* d_b = d_b_buf.data();
+    int* d_c = d_c_buf.data();
 
     // Initialize input
     for (int i = 0; i < m; ++i) {
@@ -167,29 +166,22 @@ int main() {
         b[i] = i % 1000;
     }
 
-    int* expected = (int*)malloc((m + n) * sizeof(int));
     mergeSequential(expected, a, b, m, n);
 
     CUDA_OK(cudaMemcpy(d_a, a, m * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_OK(cudaMemcpy(d_b, b, n * sizeof(int), cudaMemcpyHostToDevice));
 
-    // events for timing
-    cudaEvent_t startEvent, stopEvent;
-    CUDA_OK(cudaEventCreate(&startEvent));
-    CUDA_OK(cudaEventCreate(&stopEvent));
+    CudaTimer timer;
+    float ms = 0.0f;
 
     // -------------- Merge using naive kernel --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
     unsigned int numBlocks = (m + n + ELEM_PER_BLOCK - 1) / ELEM_PER_BLOCK;
 
     for (int i = 0; i < NUM_REPS; i++) {
         merge<<<numBlocks, THREADS_PER_BLOCK>>>(d_a, d_b, d_c, m, n);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    float ms;
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[baseline] Average time per merge: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -199,15 +191,12 @@ int main() {
     assert(verify_result(c, expected, m + n));
 
     // -------------- Merge using shared memory --------------
-    CUDA_OK(cudaEventRecord(startEvent));
+    timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        mergeTiling<<<numBlocks, THREADS_PER_BLOCK>>>(d_a, d_b, d_c, m, n);
+        mergeTiling<<<numBlocks, THREADS_PER_BLOCK>>>(d_c, d_a, d_b, m, n);
     }
-
-    CUDA_OK(cudaEventRecord(stopEvent));
-    CUDA_OK(cudaEventSynchronize(stopEvent));
-    CUDA_OK(cudaEventElapsedTime(&ms, startEvent, stopEvent));
+    ms = timer.elapsed_ms();
     printf("[shared memory] Average time per merge: %f ms\n", ms / NUM_REPS);
 
     // Copy output to CPU
@@ -217,16 +206,6 @@ int main() {
     assert(verify_result(c, expected, m + n));
 
     printf("Merge completed successfully.\n");
-
-    free(a);
-    free(b);
-    free(c);
-    free(expected);
-    CUDA_OK(cudaFree(d_a));
-    CUDA_OK(cudaFree(d_b));
-    CUDA_OK(cudaFree(d_c));
-    CUDA_OK(cudaEventDestroy(startEvent));
-    CUDA_OK(cudaEventDestroy(stopEvent));;
 
     return 0;
 }
