@@ -37,18 +37,20 @@ __global__ void top_k(int *output, const int *input, const int len) {
         topk[i] = INT_MIN;
     }
 
-    // grid stride loop to load data
+    // Each input[i] traversed is inserted into the thread-private topk[TOP_K]
     for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < len; i += blockDim.x * gridDim.x) {
         insert_top_k(topk, input[i]);
     }
-    // write thread-local top K to shared memory
+    // Write thread-local top K to shared memory
     for (int i = 0; i < TOP_K; ++i) {
         s_mem[threadIdx.x * TOP_K + i] = topk[i];
     }
 	__syncthreads();
 
     for (int total = blockDim.x / 2; total > 0; total >>= 1) {
-        if (threadIdx.x < total) { // parallel sweep reduction
+		// The first half of the threads (where threadIdx.x < total) sequentially
+		// merge the TOP_K values from their "paired threads" into their own TOP_K
+        if (threadIdx.x < total) {
             for (int i = 0; i < TOP_K; ++i) {
                 insert_top_k(&s_mem[threadIdx.x * TOP_K], s_mem[(threadIdx.x + total) * TOP_K + i]);
             }
@@ -56,7 +58,7 @@ __global__ void top_k(int *output, const int *input, const int len) {
 		__syncthreads();
     }
 
-    // put the top K of all blocks to the output
+    // Put the top K of all blocks to the output
     if (threadIdx.x == 0) {
         for (int i = 0; i < TOP_K; ++i) {
             output[blockIdx.x * TOP_K + i] = s_mem[i];
