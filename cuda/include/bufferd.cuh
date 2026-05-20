@@ -135,6 +135,15 @@ class CudaBuffer {
 								cudaMemcpyHostToDevice, stream_));
 	}
 
+	// Copy exactly len() elements from host to device.
+	void copy_from_host_sync(const T* host_src, std::size_t count) {
+		assert(count == len_);
+		if (count == 0) return;
+		assert(ptr_ != nullptr);
+		CUDA_OK(cudaMemcpy(ptr_, host_src, count * sizeof(T),
+						   cudaMemcpyHostToDevice, stream_));
+	}
+
 	// Copy exactly len() elements from device to host.
 	void copy_to_host(T* host_dst, std::size_t count) const {
 		assert(count == len_);
@@ -142,6 +151,15 @@ class CudaBuffer {
 		assert(ptr_ != nullptr);
 		CUDA_OK(cudaMemcpyAsync(host_dst, ptr_, count * sizeof(T),
 								cudaMemcpyDeviceToHost, stream_));
+	}
+
+	// Copy exactly len() elements from device to host.
+	void copy_to_host_sync(T* host_dst, std::size_t count) const {
+		assert(count == len_);
+		if (count == 0) return;
+		assert(ptr_ != nullptr);
+		CUDA_OK(cudaMemcpy(host_dst, ptr_, count * sizeof(T),
+						   cudaMemcpyDeviceToHost, stream_));
 	}
 
 	// Append elements from host into the remaining capacity.

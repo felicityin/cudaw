@@ -12,7 +12,7 @@ const int BLOCK_SIZE = 256;
 const int TOP_K = 10;
 
 // topk: 10, 9, 8, ..., 1
-__device__ __host__ void insertTopK(int *topk, int val) {
+__device__ __host__ void insert_top_k(int *topk, int val) {
     if (val <= topk[TOP_K - 1]) {
         return;
     }
@@ -29,7 +29,7 @@ __device__ __host__ void insertTopK(int *topk, int val) {
     topk[0] = val;
 }
 
-__global__ void topK(int *output, const int *input, const int len) {
+__global__ void top_k(int *output, const int *input, const int len) {
     __shared__ int s_mem[BLOCK_SIZE * TOP_K];
 
     int topk[TOP_K];
@@ -39,20 +39,21 @@ __global__ void topK(int *output, const int *input, const int len) {
 
     // grid stride loop to load data
     for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < len; i += blockDim.x * gridDim.x) {
-        insertTopK(topk, input[i]);
+        insert_top_k(topk, input[i]);
     }
     // write thread-local top K to shared memory
     for (int i = 0; i < TOP_K; ++i) {
         s_mem[threadIdx.x * TOP_K + i] = topk[i];
     }
+	__syncthreads();
 
     for (int total = blockDim.x / 2; total > 0; total >>= 1) {
-        __syncthreads();
         if (threadIdx.x < total) { // parallel sweep reduction
             for (int i = 0; i < TOP_K; ++i) {
-                insertTopK(&s_mem[threadIdx.x * TOP_K], s_mem[(threadIdx.x + total) * TOP_K + i]);
+                insert_top_k(&s_mem[threadIdx.x * TOP_K], s_mem[(threadIdx.x + total) * TOP_K + i]);
             }
         }
+		__syncthreads();
     }
 
     // put the top K of all blocks to the output
@@ -88,9 +89,9 @@ int main() {
     timer.start();
 
     for (int i = 0; i < NUM_REPS; i++) {
-        topK<<<GRID_SIZE, BLOCK_SIZE>>>(d_output_1, d_input, n);
+        top_k<<<GRID_SIZE, BLOCK_SIZE>>>(d_output_1, d_input, n);
 
-        topK<<<1, BLOCK_SIZE>>>(d_output, d_output_1, TOP_K * GRID_SIZE);
+        top_k<<<1, BLOCK_SIZE>>>(d_output, d_output_1, TOP_K * GRID_SIZE);
 
         CUDA_OK(cudaDeviceSynchronize());
     }
@@ -103,7 +104,7 @@ int main() {
     // Verify result
     int cpu_topk[TOP_K] = {0};
     for (int i = 0; i < n; ++i) {
-        insertTopK(cpu_topk, h_input[i]);
+        insert_top_k(cpu_topk, h_input[i]);
     }
     for (int i = 0; i < TOP_K; ++i) {
         assert(h_output[i] == cpu_topk[i]);
