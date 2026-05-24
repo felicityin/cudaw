@@ -94,6 +94,84 @@ __global__ void multiply_tiling(int *output, const int *a, const int *b, int m, 
     }
 }
 
+
+template <int BLOCK_SIZE>
+// Vectorized tiled GEMM kernel: each thread computes 4 contiguous output columns.
+__global__ void multiply_tiling_int4(int *output, const int *a, const int *b, int m, int n, int k) {
+    static_assert(BLOCK_SIZE % 4 == 0, "BLOCK_SIZE must be divisible by 4");
+	// Keep A tile scalar: each iteration consumes one A value and broadcasts it across 4 B lanes.
+    __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
+    // B tile is stored as int4 vectors along the column dimension.
+    __shared__ int4 sub_b[BLOCK_SIZE][BLOCK_SIZE / 4];
+
+    int y = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    // threadIdx.x indexes vector lanes, each lane covers 4 scalar columns.
+    int vec_x = threadIdx.x;
+    int x = blockIdx.x * BLOCK_SIZE + vec_x * 4;
+
+    int4 sum = make_int4(0, 0, 0, 0);
+
+    for (int step = 0; step < n; step += BLOCK_SIZE) {
+        int a_col = step + vec_x * 4;
+        int *a_dst = &sub_a[threadIdx.y][vec_x * 4];
+
+        // Vectorized load from A when 4-wide access is in-bounds.
+        if (y < m && (a_col + 3) < n) {
+			// The addresses of the shared memory are totally different than the addresses of the global memory.
+			// Total in the size of each address, for example, for the shard memory,
+			// we have six hexadecimal digits size.
+			// For the global memory, it has like 12 hexadecimal digits.
+            *reinterpret_cast<int4 *>(a_dst) =
+                *reinterpret_cast<const int4 *>(&a[y * n + a_col]);
+        } else {
+            a_dst[0] = (y < m && a_col < n) ? a[y * n + a_col] : 0;
+            a_dst[1] = (y < m && (a_col + 1) < n) ? a[y * n + a_col + 1] : 0;
+            a_dst[2] = (y < m && (a_col + 2) < n) ? a[y * n + a_col + 2] : 0;
+            a_dst[3] = (y < m && (a_col + 3) < n) ? a[y * n + a_col + 3] : 0;
+        }
+
+        int b_row = step + threadIdx.y;
+        // Vectorized load from B when 4 contiguous columns are in-bounds.
+        if (b_row < n && (x + 3) < k) {
+            sub_b[threadIdx.y][vec_x] =
+                *reinterpret_cast<const int4 *>(&b[b_row * k + x]);
+        } else {
+            // Scalar fallback for boundary tiles.
+            int4 b_vec = make_int4(0, 0, 0, 0);
+            if (b_row < n && x < k) b_vec.x = b[b_row * k + x];
+            if (b_row < n && (x + 1) < k) b_vec.y = b[b_row * k + x + 1];
+            if (b_row < n && (x + 2) < k) b_vec.z = b[b_row * k + x + 2];
+            if (b_row < n && (x + 3) < k) b_vec.w = b[b_row * k + x + 3];
+            sub_b[threadIdx.y][vec_x] = b_vec;
+        }
+
+        __syncthreads();
+
+        // Dot product between one A row fragment and one B column-vector fragment.
+        for (int i = 0; i < BLOCK_SIZE; i++) {
+			// C[y, x] = Σ_i A[y, i] * B[i, x]
+			// A thread not only computes C[y, x], but also computes:
+			// - C[y, x]
+			// - C[y, x+1]
+			// - C[y, x+2]
+			// - C[y, x+3]
+			int a_val = sub_a[threadIdx.y][i];
+            int4 b_vec = sub_b[i][vec_x];
+            sum.x += a_val * b_vec.x;
+            sum.y += a_val * b_vec.y;
+            sum.z += a_val * b_vec.z;
+            sum.w += a_val * b_vec.w;
+        }
+        __syncthreads();
+    }
+
+    if (y < m && x < k) output[y * k + x] = sum.x;
+    if (y < m && (x + 1) < k) output[y * k + x + 1] = sum.y;
+    if (y < m && (x + 2) < k) output[y * k + x + 2] = sum.z;
+    if (y < m && (x + 3) < k) output[y * k + x + 3] = sum.w;
+}
+
+
 template <int BLOCK_SIZE, int COARSE_FACTOR>
 __global__ void multiply_tiling_coarse(int *output, const int *a, const int *b, int m, int n, int k) {
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
@@ -229,6 +307,26 @@ int main() {
     }
     ms = timer.elapsed_ms();
     printf("[shared memory] Average time per multiplication: %f ms\n", ms / NUM_REPS);
+
+    d_c_buf.copy_to_host(h_c, static_cast<std::size_t>(m) * k);
+    d_c_buf.synchronize();
+
+    assert(verify_result(h_c, c, m, k));
+
+    // -------------- Multiplication using shared memory + int4 kernel --------------
+
+    // int4 version: x-dimension threads are reduced by 4, each thread outputs 4 columns.
+
+    dim3 blockSizeInt4(BLOCK_SIZE / 4, BLOCK_SIZE);
+    dim3 gridSizeInt4((k + BLOCK_SIZE - 1) / BLOCK_SIZE, (m + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    timer.start();
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        multiply_tiling_int4<BLOCK_SIZE><<<gridSizeInt4, blockSizeInt4>>>(d_c, d_a, d_b, m, n, k);
+    }
+    ms = timer.elapsed_ms();
+    printf("[shared memory + int4] Average time per multiplication: %f ms\n", ms / NUM_REPS);
 
     d_c_buf.copy_to_host(h_c, static_cast<std::size_t>(m) * k);
     d_c_buf.synchronize();
