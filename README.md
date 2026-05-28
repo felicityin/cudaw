@@ -1,6 +1,6 @@
 # Description
 
-Lecture notes for [CMPS 297S/396AA – GPU Computing](https://www.cs.cmu.edu/~dga/courses/10601/)
+Lecture notes for [CMPS 297S/396AA – GPU Computing](https://www.cs.cmu.edu/~dga/courses/10601/), etc.
 
 # Run
 

@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include <cuda_fp16.h>
+#include <cublas_v2.h>
 #include <mma.h>
 
 #include "include/buffer.cuh"
@@ -10,6 +11,15 @@
 #include "include/timer.cuh"
 
 const int NUM_REPS = 100;
+
+#define CUBLAS_OK(expr) \
+    do { \
+        cublasStatus_t code = expr; \
+        if (code != CUBLAS_STATUS_SUCCESS) { \
+            fprintf(stderr, "cuBLAS Error %s at %s:%d\n", cublas_status_name(code), __FILE__, __LINE__); \
+            exit(1); \
+        } \
+    } while (0)
 
 void cpu_matrix_multiply(int *output, const int *a, const int *b, int m, int n, int k) {
     for (int y = 0; y < m; y++) {
@@ -251,7 +261,11 @@ __global__ void multiply_tiling_wmma(float *output, const half *a, const half *b
         return;
     }
 
+	// https://docs.nvidia.com/cuda/cuda-c-programming-guide/#warp-matrix-functions
     // Fragments are warp-level register tiles managed by the WMMA API.
+	// Fragment represents a tile of matrix stored in registers.
+	// eg. 16 x 16 x 16 (m x n x k) tile of A, B, or C.
+	// WMMA API supports a few tile sizes, but 16 x 16 x 16 is the most common.
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
@@ -263,11 +277,66 @@ __global__ void multiply_tiling_wmma(float *output, const half *a, const half *b
     for (int tile_k = 0; tile_k < n; tile_k += 16) {
         wmma::load_matrix_sync(a_frag, a + tile_row * n + tile_k, n);
         wmma::load_matrix_sync(b_frag, b + tile_k * k + tile_col, k);
+		// Perform the matrix multiplication and accumulate the result in c_frag.
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
     }
 
     // Store the completed 16x16 tile back to row-major global memory.
     wmma::store_matrix_sync(output + tile_row * k + tile_col, c_frag, k, wmma::mem_row_major);
+}
+
+const char *cublas_status_name(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: return "CUBLAS_STATUS_SUCCESS";
+        case CUBLAS_STATUS_NOT_INITIALIZED: return "CUBLAS_STATUS_NOT_INITIALIZED";
+        case CUBLAS_STATUS_ALLOC_FAILED: return "CUBLAS_STATUS_ALLOC_FAILED";
+        case CUBLAS_STATUS_INVALID_VALUE: return "CUBLAS_STATUS_INVALID_VALUE";
+        case CUBLAS_STATUS_ARCH_MISMATCH: return "CUBLAS_STATUS_ARCH_MISMATCH";
+        case CUBLAS_STATUS_MAPPING_ERROR: return "CUBLAS_STATUS_MAPPING_ERROR";
+        case CUBLAS_STATUS_EXECUTION_FAILED: return "CUBLAS_STATUS_EXECUTION_FAILED";
+        case CUBLAS_STATUS_INTERNAL_ERROR: return "CUBLAS_STATUS_INTERNAL_ERROR";
+        case CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
+        case CUBLAS_STATUS_LICENSE_ERROR: return "CUBLAS_STATUS_LICENSE_ERROR";
+        default: return "CUBLAS_STATUS_UNKNOWN";
+    }
+}
+
+// https://docs.nvidia.com/cuda/cublas/index.html
+// cuBLAS launches its own optimized GEMM kernel internally; this function is a
+// host-side wrapper, not a handwritten __global__ kernel. Using FP16 inputs,
+// FP32 accumulation, tensor-op math mode, and CUBLAS_GEMM_DEFAULT_TENSOR_OP lets
+// cuBLAS select Tensor Core instructions on supported GPUs.
+//
+// The rest of this sample stores matrices in row-major order:
+//   A is m x n, B is n x k, C is m x k, and C = A * B.
+// cuBLAS interprets device pointers as column-major matrices. The same memory
+// can be viewed as transposed column-major matrices, so row-major GEMM becomes:
+//   C^T(k x m) = B^T(k x n) * A^T(n x m).
+// That is why the cuBLAS call below passes B first, then A, with dimensions
+// (k, m, n) and leading dimensions (k, n, k).
+void multiply_cublas_tensor(cublasHandle_t handle,
+							float *output,
+							const half *a,
+							const half *b,
+							int m,
+							int n,
+							int k) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+	// https://docs.nvidia.com/cuda/cublas/index.html?#cublasgemmex
+    // Compute output = alpha * (b * a) + beta * output in the transposed
+    // column-major view described above.
+    CUBLAS_OK(cublasGemmEx(handle,
+                           CUBLAS_OP_N, CUBLAS_OP_N,
+                           k, m, n,
+                           &alpha,
+                           b, CUDA_R_16F, k,
+                           a, CUDA_R_16F, n,
+                           &beta,
+                           output, CUDA_R_32F, k,
+                           CUDA_R_32F,
+                           CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
 
 bool verify_result(const int *a, const int *b, int width, int height) {
@@ -302,7 +371,7 @@ void print_matrix(const int *matrix, int width, int height) {
     }
 }
 
-// nvcc matrix_multiply.cu -arch=sm_70
+// nvcc matrix_multiply.cu -arch=sm_80 -lcublas
 int main() {
     int m = 1 << 10;
     int n = 1 << 11;
@@ -432,6 +501,31 @@ int main() {
     // WMMA accumulates in float, so a small tolerance is used instead of exact equality.
     assert(verify_result_float(h_c_wmma, c_wmma, k, m));
 
+    // -------------- Multiplication using cuBLAS tensor core kernel --------------
+
+	// A cuBLAS handle owns library state for subsequent GEMM calls. Enabling
+    // tensor-op math permits cuBLAS to dispatch Tensor Core kernels when the
+    // operand types, alignment, dimensions, and GPU architecture support it.
+    cublasHandle_t cublas_handle;
+    CUBLAS_OK(cublasCreate(&cublas_handle));
+    CUBLAS_OK(cublasSetMathMode(cublas_handle, CUBLAS_TENSOR_OP_MATH));
+
+    // This benchmark uses the same half-precision inputs and float output as the
+    // WMMA path, but delegates tile scheduling, memory movement, and Tensor Core
+    // instruction selection to cuBLAS.
+    timer.start();
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        multiply_cublas_tensor(cublas_handle, d_c_wmma, d_a_wmma, d_b_wmma, m, n, k);
+    }
+    ms = timer.elapsed_ms();
+    printf("[cuBLAS tensor core] Average time per multiplication: %f ms\n", ms / NUM_REPS);
+
+    d_c_wmma_buf.copy_to_host(h_c_wmma, static_cast<std::size_t>(m) * k);
+    d_c_wmma_buf.synchronize();
+
+    assert(verify_result_float(h_c_wmma, c_wmma, k, m));
+
     // -------------- Multiplication using shared memory + int4 kernel --------------
 
     // int4 version: x-dimension threads are reduced by 4, each thread outputs 4 columns.
@@ -471,6 +565,8 @@ int main() {
     assert(verify_result(h_c, c, m, k));
 
     printf("Multiplication completed successfully.\n");
+
+    CUBLAS_OK(cublasDestroy(cublas_handle));
 
     return 0;
 }
