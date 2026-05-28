@@ -1,5 +1,9 @@
 #include <stdio.h>
 #include <assert.h>
+#include <math.h>
+
+#include <cuda_fp16.h>
+#include <mma.h>
 
 #include "include/buffer.cuh"
 #include "include/exception.cuh"
@@ -11,6 +15,18 @@ void cpu_matrix_multiply(int *output, const int *a, const int *b, int m, int n, 
     for (int y = 0; y < m; y++) {
         for (int x = 0; x < k; x++) {
             int tmp = 0;
+            for (int step = 0; step < n; step++) {
+                tmp += a[y * n + step] * b[step * k + x];
+            }
+            output[y * k + x] = tmp;
+        }
+    }
+}
+
+void cpu_matrix_multiply_float(float *output, const float *a, const float *b, int m, int n, int k) {
+    for (int y = 0; y < m; y++) {
+        for (int x = 0; x < k; x++) {
+            float tmp = 0.0f;
             for (int step = 0; step < n; step++) {
                 tmp += a[y * n + step] * b[step * k + x];
             }
@@ -94,7 +110,6 @@ __global__ void multiply_tiling(int *output, const int *a, const int *b, int m, 
     }
 }
 
-
 template <int BLOCK_SIZE>
 // Vectorized tiled GEMM kernel: each thread computes 4 contiguous output columns.
 __global__ void multiply_tiling_int4(int *output, const int *a, const int *b, int m, int n, int k) {
@@ -171,7 +186,6 @@ __global__ void multiply_tiling_int4(int *output, const int *a, const int *b, in
     if (y < m && (x + 3) < k) output[y * k + x + 3] = sum.w;
 }
 
-
 template <int BLOCK_SIZE, int COARSE_FACTOR>
 __global__ void multiply_tiling_coarse(int *output, const int *a, const int *b, int m, int n, int k) {
     __shared__ int sub_a[BLOCK_SIZE][BLOCK_SIZE];
@@ -219,10 +233,59 @@ __global__ void multiply_tiling_coarse(int *output, const int *a, const int *b, 
     }
 }
 
+// WMMA uses tensor cores on 16x16x16 fragments. The input matrices use half
+// precision because tensor cores consume FP16 operands efficiently, while the
+// accumulator stays in float to reduce round-off error.
+//
+// Each CUDA block owns one 16x16 output tile C[tile_row:tile_row+16,
+// tile_col:tile_col+16]. This compact teaching kernel assumes m, n, and k are
+// multiples of 16; pad inputs first if boundary tiles are needed.
+__global__ void multiply_tiling_wmma(float *output, const half *a, const half *b, int m, int n, int k) {
+    using namespace nvcuda;
+
+    // Map the block index to the top-left corner of the output tile.
+    int tile_row = blockIdx.y * 16;
+    int tile_col = blockIdx.x * 16;
+
+    if (tile_row >= m || tile_col >= k) {
+        return;
+    }
+
+    // Fragments are warp-level register tiles managed by the WMMA API.
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // Walk across the K dimension in 16-wide slices:
+    // C_tile += A_tile(row, tile_k) * B_tile(tile_k, col).
+    for (int tile_k = 0; tile_k < n; tile_k += 16) {
+        wmma::load_matrix_sync(a_frag, a + tile_row * n + tile_k, n);
+        wmma::load_matrix_sync(b_frag, b + tile_k * k + tile_col, k);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // Store the completed 16x16 tile back to row-major global memory.
+    wmma::store_matrix_sync(output + tile_row * k + tile_col, c_frag, k, wmma::mem_row_major);
+}
+
 bool verify_result(const int *a, const int *b, int width, int height) {
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             if (a[y * width + x] != b[y * width + x]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool verify_result_float(const float *a, const float *b, int width, int height) {
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            float diff = fabsf(a[y * width + x] - b[y * width + x]);
+            if (diff > 1e-3f) {
                 return false;
             }
         }
@@ -239,6 +302,7 @@ void print_matrix(const int *matrix, int width, int height) {
     }
 }
 
+// nvcc matrix_multiply.cu -arch=sm_70
 int main() {
     int m = 1 << 10;
     int n = 1 << 11;
@@ -248,17 +312,37 @@ int main() {
     auto h_b_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(n) * k);
     auto h_c_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
     auto c_buf = HostBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
+    // WMMA path uses separate buffers so the original integer examples stay unchanged.
+    auto h_a_wmma_buf = HostBuffer<half>::with_capacity(static_cast<std::size_t>(m) * n);
+    auto h_b_wmma_buf = HostBuffer<half>::with_capacity(static_cast<std::size_t>(n) * k);
+    // Keep float copies on the host to build a CPU reference result before converting to half.
+    auto h_a_wmma_float_buf = HostBuffer<float>::with_capacity(static_cast<std::size_t>(m) * n);
+    auto h_b_wmma_float_buf = HostBuffer<float>::with_capacity(static_cast<std::size_t>(n) * k);
+    auto h_c_wmma_buf = HostBuffer<float>::with_capacity(static_cast<std::size_t>(m) * k);
+    auto c_wmma_buf = HostBuffer<float>::with_capacity(static_cast<std::size_t>(m) * k);
     int* h_a = h_a_buf.data();
     int* h_b = h_b_buf.data();
     int* h_c = h_c_buf.data();
     int* c = c_buf.data();
+    half* h_a_wmma = h_a_wmma_buf.data();
+    half* h_b_wmma = h_b_wmma_buf.data();
+    float* h_a_wmma_float = h_a_wmma_float_buf.data();
+    float* h_b_wmma_float = h_b_wmma_float_buf.data();
+    float* h_c_wmma = h_c_wmma_buf.data();
+    float* c_wmma = c_wmma_buf.data();
 
     auto d_a_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(m) * n);
     auto d_b_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(n) * k);
     auto d_c_buf = CudaBuffer<int>::with_capacity(static_cast<std::size_t>(m) * k);
+    auto d_a_wmma_buf = CudaBuffer<half>::with_capacity(static_cast<std::size_t>(m) * n);
+    auto d_b_wmma_buf = CudaBuffer<half>::with_capacity(static_cast<std::size_t>(n) * k);
+    auto d_c_wmma_buf = CudaBuffer<float>::with_capacity(static_cast<std::size_t>(m) * k);
     int* d_a = d_a_buf.data();
     int* d_b = d_b_buf.data();
     int* d_c = d_c_buf.data();
+    half* d_a_wmma = d_a_wmma_buf.data();
+    half* d_b_wmma = d_b_wmma_buf.data();
+    float* d_c_wmma = d_c_wmma_buf.data();
 
     // Initialize input matrix
     for (int i = 0; i < m * n; ++i) {
@@ -267,9 +351,21 @@ int main() {
     for (int i = 0; i < n * k; ++i) {
         h_b[i] = i;
     }
+    // Use small integer-valued floats so half conversion is exact and CPU/GPU
+    // comparison only reflects accumulation behavior.
+    for (int i = 0; i < m * n; ++i) {
+        h_a_wmma_float[i] = static_cast<float>(i % 3);
+        h_a_wmma[i] = __float2half(h_a_wmma_float[i]);
+    }
+    for (int i = 0; i < n * k; ++i) {
+        h_b_wmma_float[i] = static_cast<float>(i % 5);
+        h_b_wmma[i] = __float2half(h_b_wmma_float[i]);
+    }
 
     d_a_buf.copy_from_host(h_a, static_cast<std::size_t>(m) * n);
     d_b_buf.copy_from_host(h_b, static_cast<std::size_t>(n) * k);
+    d_a_wmma_buf.copy_from_host(h_a_wmma, static_cast<std::size_t>(m) * n);
+    d_b_wmma_buf.copy_from_host(h_b_wmma, static_cast<std::size_t>(n) * k);
 
     CudaTimer timer;
     float ms = 0.0f;
@@ -312,6 +408,29 @@ int main() {
     d_c_buf.synchronize();
 
     assert(verify_result(h_c, c, m, k));
+
+    // -------------- Multiplication using WMMA tensor core kernel --------------
+
+    // Build the CPU reference using the pre-conversion float inputs.
+    cpu_matrix_multiply_float(c_wmma, h_a_wmma_float, h_b_wmma_float, m, n, k);
+
+    // One warp computes one 16x16 WMMA output tile.
+    dim3 blockSizeWmma(32);
+    dim3 gridSizeWmma((k + 15) / 16, (m + 15) / 16);
+
+    timer.start();
+
+    for (int i = 0; i < NUM_REPS; i++) {
+        multiply_tiling_wmma<<<gridSizeWmma, blockSizeWmma>>>(d_c_wmma, d_a_wmma, d_b_wmma, m, n, k);
+    }
+    ms = timer.elapsed_ms();
+    printf("[wmma tensor core] Average time per multiplication: %f ms\n", ms / NUM_REPS);
+
+    d_c_wmma_buf.copy_to_host(h_c_wmma, static_cast<std::size_t>(m) * k);
+    d_c_wmma_buf.synchronize();
+
+    // WMMA accumulates in float, so a small tolerance is used instead of exact equality.
+    assert(verify_result_float(h_c_wmma, c_wmma, k, m));
 
     // -------------- Multiplication using shared memory + int4 kernel --------------
 
