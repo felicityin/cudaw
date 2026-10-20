@@ -48,19 +48,28 @@ __global__ void enqueue_v2(int* queue, int* queue_size, const int* input, int n)
             // Assign a leader thread
             int active_threads = __activemask();
             int leader = __ffs(active_threads) - 1;
+
             // Find how many threads are active
             int num_active_threads = __popc(active_threads);
+
             // Leader allocate in queue
             int j;
             if (threadIdx.x % WARP_SIZE == leader) {
                 j = atomicAdd(queue_size, num_active_threads);
             }
+
             // Shuffle the leader's j to all other threads
             j = __shfl_sync(active_threads, j, leader);
+
             // Find the position of each active thread in the queue
+
+            // Mask all lanes preceding the current lane within this warp.
             int prev_threads_mask = (1 << (threadIdx.x % WARP_SIZE)) - 1;
+            // Keep only the active preceding lanes to determine this thread's offset.
             int prev_active_threads = active_threads & prev_threads_mask;
+            // Count preceding active lanes to obtain this thread's queue offset.
             int offset = __popc(prev_active_threads);
+
             // Store the result
             queue[j + offset] = threadIdx.x;
         }
